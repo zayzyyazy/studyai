@@ -1,0 +1,101 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body, #root {
+  height: 100%;
+  overflow: hidden;
+  font-family: -apple-system, BlinkMacSystemFont, 'Inter', system-ui, sans-serif;
+  background-color: #0f1117;
+  color: #e2e8f0;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #2a3347;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #3a4560;
+}
+
+/* Drag region for titlebar */
+.drag-region {
+  -webkit-app-region: drag;
+}
+.no-drag {
+  -webkit-app-region: no-drag;
+}
+
+/* Prose / markdown styles */
+.markdown-body h1 { font-size: 1.5rem; font-weight: 700; margin: 1.25rem 0 0.75rem; color: #e2e8f0; }
+.markdown-body h2 { font-size: 1.25rem; font-weight: 600; margin: 1rem 0 0.5rem; color: #e2e8f0; }
+.markdown-body h3 { font-size: 1.1rem; font-weight: 600; margin: 0.875rem 0 0.4rem; color: #cbd5e1; }
+.markdown-body p { margin: 0.5rem 0; line-height: 1.7; color: #94a3b8; }
+.markdown-body ul, .markdown-body ol { padding-left: 1.5rem; margin: 0.5rem 0; }
+.markdown-body li { margin: 0.25rem 0; line-height: 1.6; color: #94a3b8; }
+.markdown-body strong { font-weight: 600; color: #e2e8f0; }
+.markdown-body em { color: #818cf8; font-style: italic; }
+.markdown-body code { background: #1e2535; padding: 0.15rem 0.4rem; border-radius: 4px; font-size: 0.875rem; color: #a5b4fc; font-family: 'JetBrains Mono', monospace; }
+.markdown-body pre { background: #161b27; border: 1px solid #2a3347; border-radius: 8px; padding: 1rem; margin: 0.75rem 0; overflow-x: auto; }
+.markdown-body pre code { background: transparent; padding: 0; color: #a5b4fc; }
+.markdown-body blockquote { border-left: 3px solid #6366f1; padding-left: 1rem; margin: 0.75rem 0; color: #64748b; }
+.markdown-body hr { border: none; border-top: 1px solid #2a3347; margin: 1rem 0; }
+
+/* KaTeX (remark-math + rehype-katex) */
+.markdown-body .katex { font-size: 1.05em; color: #e8edf5; }
+.markdown-body .katex-display { margin: 0.85rem 0; overflow-x: auto; overflow-y: hidden; }
+.markdown-body p .katex { color: #d1d9e8; }
+
+/* Comfortable reading overlay (overview / summary / concepts / quiz / stitched deep dive) */
+.markdown-body-reading h1 { font-size: 1.75rem; margin-top: 0; line-height: 1.35; }
+.markdown-body-reading h2 { font-size: 1.4rem; margin-top: 1.75rem; }
+.markdown-body-reading h3 { font-size: 1.2rem; }
+.markdown-body-reading p,
+.markdown-body-reading li { font-size: 1.0625rem; line-height: 1.75; }
+.markdown-body-reading .katex { font-size: 1.08em; color: #e8edf5; }
+.markdown-body-reading .katex-display { margin: 1rem 0; }
+
+/* Animations */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes slideIn {
+  from { opacity: 0; transform: translateX(-8px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+.animate-fade-in { animation: fadeIn 0.25s ease forwards; }
+.animate-slide-in { animation: slideIn 0.2s ease forwards; }
+.animate-spin { animation: spin 1s linear infinite; }
+.animate-pulse-slow { animation: pulse 2s ease infinite; }
+
+/* Drop zone */
+.drop-zone-active {
+  border-color: #6366f1 !important;
+  background-color: rgba(99, 102, 241, 0.08) !important;
+}
