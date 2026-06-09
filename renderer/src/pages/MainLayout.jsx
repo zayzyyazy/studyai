@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import Sidebar from '../components/Sidebar';
 import CoursePage from './CoursePage';
+import CourseErrorBoundary from '../components/CourseErrorBoundary';
 import SettingsPanel from './SettingsPanel';
 import DropHint from '../components/DropHint';
 import StudyControlPage from './StudyControlPage';
@@ -12,7 +13,10 @@ export default function MainLayout({
   selectedCourse, onSelectCourse,
   processedLecture, onClearProcessed, lectureRefreshEpoch = 0,
   onDropFiles,
-  onOpenPdf
+  onOpenPdf,
+  onOpenLecture,
+  lectureOpenRequest,
+  onClearLectureOpenRequest,
 }) {
   const [showSettings, setShowSettings] = useState(false);
   const [showControl, setShowControl] = useState(false);
@@ -43,7 +47,7 @@ export default function MainLayout({
       <Sidebar
         courses={state.courses}
         selectedCourse={selectedCourse}
-        onSelectCourse={(c) => { closeAll(); onSelectCourse(c); }}
+        onSelectCourse={(c) => { closeAll(); onClearLectureOpenRequest?.(); onSelectCourse(c); }}
         onOpenHome={() => { closeAll(); setShowHome(true); onSelectCourse(null); }}
         showHome={showHome}
         onOpenPlanner={() => { closeAll(); setShowPlanner(true); onSelectCourse(null); }}
@@ -57,7 +61,7 @@ export default function MainLayout({
 
       {/* Main content */}
       <div
-        className="flex-1 overflow-hidden"
+        className="flex-1 overflow-hidden min-h-0 min-w-0 flex flex-col"
         onDragOver={e => { e.preventDefault(); e.stopPropagation(); }}
         onDrop={handleLocalDrop}
       >
@@ -76,16 +80,31 @@ export default function MainLayout({
         ) : showPlanner ? (
           <PlannerPage />
         ) : showHome ? (
-          <DashboardPage onOpenPdf={onOpenPdf} onOpenPlanner={() => { closeAll(); setShowPlanner(true); }} />
-        ) : selectedCourse ? (
-          <CoursePage
-            course={selectedCourse}
-            processedLecture={processedLecture}
-            onClearProcessed={onClearProcessed}
-            onDropFiles={(files, options) => onDropFiles(files, options)}
-            state={state}
-            update={update}
+          <DashboardPage
+            courses={state.courses}
+            onOpenPdf={onOpenPdf}
+            onOpenPlanner={() => { closeAll(); setShowPlanner(true); }}
+            onOpenLecture={(req) => { closeAll(); onOpenLecture(req); }}
           />
+        ) : selectedCourse ? (
+          <CourseErrorBoundary resetKey={selectedCourse?.id || selectedCourse?.name}>
+            <CoursePage
+              course={selectedCourse}
+              processedLecture={processedLecture}
+              onClearProcessed={onClearProcessed}
+              onDropFiles={(files, options) => onDropFiles(files, options)}
+              state={state}
+              update={update}
+              openRequest={lectureOpenRequest}
+              onOpenRequestHandled={onClearLectureOpenRequest}
+              onBackToDashboard={() => {
+                onClearLectureOpenRequest?.();
+                onSelectCourse(null);
+                closeAll();
+                setShowHome(true);
+              }}
+            />
+          </CourseErrorBoundary>
         ) : (
           <DropHint onOpenPdf={onOpenPdf} />
         )}

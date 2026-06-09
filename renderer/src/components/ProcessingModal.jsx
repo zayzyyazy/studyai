@@ -8,6 +8,7 @@ const STEPS = [
   { key: 'concepts', label: 'Extracting key concepts', icon: '🧠' },
   { key: 'overview', label: 'Building map / overview', icon: '🗺️' },
   { key: 'quiz', label: 'Generating recall questions', icon: '❓' },
+  { key: 'aufgaben', label: 'Creating practice exercises', icon: '📝' },
   { key: 'naming', label: 'Pruning & naming study topics', icon: '✨' },
   { key: 'writing', label: 'Writing files to vault', icon: '💾' },
   { key: 'done', label: 'Processing complete!', icon: '✅' }
@@ -81,20 +82,31 @@ export default function ProcessingModal({
 
   if (batch?.finished) {
     const ok = batch.completed?.length || 0;
+    const skipped = batch.skipped?.length || 0;
     const fail = batch.failed?.length || 0;
     return (
       <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
         <div className="bg-bg-secondary border border-border-DEFAULT rounded-2xl p-6 w-full max-w-sm mx-4 shadow-2xl">
           <div className="text-3xl mb-3">✅</div>
-          <h2 className="text-lg font-semibold text-text-primary mb-2">Batch complete</h2>
+          <h2 className="text-lg font-semibold text-text-primary mb-2">
+            {ok === 0 && skipped > 0 && fail === 0 ? 'Nothing new to import' : 'Batch complete'}
+          </h2>
           <p className="text-sm text-text-secondary mb-4">
             <span className="text-green-400 font-medium">{ok}</span> lecture{ok !== 1 ? 's' : ''} added
+            {skipped > 0 && <>, <span className="text-amber-400">{skipped} skipped (duplicate)</span></>}
             {fail > 0 && <>, <span className="text-red-400">{fail} failed</span></>}
           </p>
           {batch.completed?.length > 0 && (
             <ul className="text-xs text-text-secondary mb-4 max-h-32 overflow-y-auto space-y-1">
               {batch.completed.map((c) => (
                 <li key={c.name} className="truncate">✓ {c.lectureName || c.name}</li>
+              ))}
+            </ul>
+          )}
+          {batch.skipped?.length > 0 && (
+            <ul className="text-xs text-amber-400/90 mb-4 max-h-24 overflow-y-auto space-y-1">
+              {batch.skipped.map((s) => (
+                <li key={s.name} className="truncate" title={s.message}>⊘ {s.lectureName || s.name}</li>
               ))}
             </ul>
           )}

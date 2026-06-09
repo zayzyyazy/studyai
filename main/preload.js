@@ -123,7 +123,14 @@ contextBridge.exposeInMainWorld('api', {
   generateLectureQuizInteractive: (data) => ipcRenderer.invoke('lecture:generateLectureQuizInteractive', data),
   loadLectureQuizInteractive: (data) => ipcRenderer.invoke('lecture:loadLectureQuizInteractive', data),
   saveLectureQuizAttempt: (data) => ipcRenderer.invoke('lecture:saveLectureQuizAttempt', data),
+  generateAufgaben: (data) => ipcRenderer.invoke('lecture:generateAufgaben', data),
+  loadAufgaben: (data) => ipcRenderer.invoke('lecture:loadAufgaben', data),
+  saveAufgabenProgress: (data) => ipcRenderer.invoke('lecture:saveAufgabenProgress', data),
   askLectureQuick: (data) => ipcRenderer.invoke('lecture:askQuick', data),
+  listNoteCards: (data) => ipcRenderer.invoke('lecture:listNoteCards', data),
+  saveNoteCard: (data) => ipcRenderer.invoke('lecture:saveNoteCard', data),
+  deleteNoteCard: (data) => ipcRenderer.invoke('lecture:deleteNoteCard', data),
+  suggestDeepSteps: (data) => ipcRenderer.invoke('lecture:suggestDeepSteps', data),
   deleteLecture: (data) => ipcRenderer.invoke('lecture:delete', data),
 
   // Status listener (one-way from main to renderer)

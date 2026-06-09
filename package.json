@@ -9,8 +9,10 @@
     "dev:electron": "wait-on http://localhost:5173 && electron .",
     "build": "vite build && electron-builder",
     "build:renderer": "vite build",
-    "build:desk": "vite build && electron-builder --mac dir && npm run copy:desk",
-    "copy:desk": "rm -rf \"$HOME/Desktop/StudyAI-Latest.app\" && cp -R dist-app/mac-arm64/StudyAI.app \"$HOME/Desktop/StudyAI-Latest.app\" && echo \"Copied to $HOME/Desktop/StudyAI-Latest.app\"",
+    "build:desk": "vite build && electron-builder --mac dir && npm run copy:desk && npm run copy:desk2",
+    "copy:desk": "rm -rf \"$HOME/Desktop/StudyAI-Latest.app\" && cp -R dist-app/mac-arm64/StudyAI.app \"$HOME/Desktop/StudyAI-Latest.app\" && date '+%Y-%m-%d %H:%M' > \"$HOME/Desktop/StudyAI-Latest.build.txt\" && echo \"Primary build (npm run build:desk)\" >> \"$HOME/Desktop/StudyAI-Latest.build.txt\" && echo \"Copied to $HOME/Desktop/StudyAI-Latest.app\"",
+    "copy:desk2": "rm -rf \"$HOME/Desktop/StudyAI-Latest-2.app\" && cp -R dist-app/mac-arm64/StudyAI.app \"$HOME/Desktop/StudyAI-Latest-2.app\" && date '+%Y-%m-%d %H:%M' > \"$HOME/Desktop/StudyAI-Latest-2.build.txt\" && echo \"Alternate build (npm run build:desk2)\" >> \"$HOME/Desktop/StudyAI-Latest-2.build.txt\" && echo \"Copied to $HOME/Desktop/StudyAI-Latest-2.app\"",
+    "build:desk2": "vite build && electron-builder --mac dir && npm run copy:desk2",
     "preview": "vite preview"
   },
   "dependencies": {

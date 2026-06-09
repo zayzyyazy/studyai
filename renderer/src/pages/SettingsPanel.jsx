@@ -393,10 +393,12 @@ export default function SettingsPanel({ state, update, refresh, onClose }) {
                     className="bg-bg-tertiary border border-border-DEFAULT rounded-lg px-3 py-2 text-text-primary text-sm focus:outline-none focus:border-accent"
                   >
                     <option value="auto">Type: auto</option>
-                    <option value="math_stats">Math/Stats</option>
-                    <option value="applied_methods">Applied methods</option>
+                    <option value="math">Mathematics</option>
+                    <option value="statistics">Statistics</option>
+                    <option value="programming">Programming</option>
+                    <option value="psychology">Psychology</option>
                     <option value="conceptual">Conceptual</option>
-                    <option value="reading_heavy">Reading-heavy</option>
+                    <option value="reading">Reading-heavy</option>
                   </select>
                 </div>
                 <div className="flex gap-2">
@@ -468,6 +470,30 @@ export default function SettingsPanel({ state, update, refresh, onClose }) {
                           placeholder="Semester"
                           className="bg-bg-tertiary border border-border-DEFAULT rounded-lg px-3 py-1.5 text-text-primary text-sm focus:outline-none focus:border-accent"
                         />
+                      </div>
+                      <div className="grid grid-cols-2 gap-2 mb-3">
+                        <select
+                          value={editingCourse.language || 'auto'}
+                          onChange={e => setEditingCourse(p => ({ ...p, language: e.target.value }))}
+                          className="bg-bg-tertiary border border-border-DEFAULT rounded-lg px-3 py-1.5 text-text-primary text-sm focus:outline-none focus:border-accent"
+                        >
+                          <option value="auto">Language: auto</option>
+                          <option value="German">German</option>
+                          <option value="English">English</option>
+                        </select>
+                        <select
+                          value={editingCourse.courseType || 'auto'}
+                          onChange={e => setEditingCourse(p => ({ ...p, courseType: e.target.value }))}
+                          className="bg-bg-tertiary border border-border-DEFAULT rounded-lg px-3 py-1.5 text-text-primary text-sm focus:outline-none focus:border-accent"
+                        >
+                          <option value="auto">Type: auto</option>
+                          <option value="math">Mathematics</option>
+                          <option value="statistics">Statistics</option>
+                          <option value="programming">Programming</option>
+                          <option value="psychology">Psychology</option>
+                          <option value="conceptual">Conceptual</option>
+                          <option value="reading">Reading-heavy</option>
+                        </select>
                       </div>
                       <div className="flex gap-2">
                         <button onClick={() => setEditingCourse(null)}

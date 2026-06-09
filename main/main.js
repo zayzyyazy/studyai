@@ -1,9 +1,29 @@
 const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 const Store = require('electron-store');
 
 let pdfProcessingActive = false;
+let courseRowsCache = { key: '', rows: [] };
+
+function courseRowsCacheKey(courseName) {
+  const vaultPath = store.get('vaultPath') || '';
+  return `${vaultPath}::${sanitizeName(courseName || '')}`;
+}
+
+function invalidateCourseRowsCache() {
+  courseRowsCache = { key: '', rows: [] };
+}
+
+function getEnrichedCourseRows(courseName) {
+  const key = courseRowsCacheKey(courseName);
+  if (!key.endsWith('::') && courseRowsCache.key === key) return courseRowsCache.rows;
+  const raw = getCourseLectureRowsRaw(courseName);
+  const rows = enrichCourseLectureRows(courseName, raw);
+  courseRowsCache = { key, rows };
+  return rows;
+}
 
 const store = new Store({
   schema: {
@@ -170,10 +190,186 @@ ipcMain.handle('vault:checkPath', (_, vaultPath) => {
   }
 });
 
-function ensureLectureStructureFields(structure, { courseName, lecturePath, meta = {} }) {
+function getCourseMetaByName(courseName = '') {
+  const courses = store.get('courses') || [];
+  return courses.find((c) => c.name === courseName) || {};
+}
+
+/** Parse Overview "Unterthemen / Subtopics" section into theme → subtopic list. */
+function parseOverviewSubtopicTree(overview = '', language = 'German') {
+  const isGerman = language === 'German';
+  const markers = isGerman
+    ? [/##\s*Unterthemen/i, /##\s*Unterthemen und Navigation/i, /##\s*Kernthemen/i]
+    : [/##\s*Subtopics/i, /##\s*Subtopics\s*&\s*Navigation/i, /##\s*Core Themes/i];
+  let section = '';
+  for (const re of markers) {
+    const m = overview.match(re);
+    if (m) {
+      const start = m.index;
+      const rest = overview.slice(start);
+      const nextH2 = rest.slice(m[0].length).search(/\n##\s+/);
+      section = nextH2 >= 0 ? rest.slice(0, m[0].length + nextH2) : rest;
+      break;
+    }
+  }
+  if (!section) return [];
+
+  const lines = section.split('\n');
+  const trees = [];
+  let current = null;
+
+  for (const line of lines) {
+    const bold = line.match(/^\s*[-*]?\s*\*\*(.+?)\*\*/);
+    const arrow = line.match(/^\s*[-*]?\s*\*\*(.+?)\*\*\s*[-–—:]>\s*(.+)$/i)
+      || line.match(/^\s*[-*]?\s*(.+?)\s*[-–—:]>\s*(.+)$/);
+    const subBullet = line.match(/^\s{2,}[-*]\s+(.+)$/) || line.match(/^\s+[-*]\s+(.+)$/);
+    const topBullet = line.match(/^\s*[-*]\s+(.+)$/);
+
+    if (arrow) {
+      const parent = arrow[1].replace(/\*\*/g, '').trim();
+      const child = arrow[2].trim();
+      if (!current || !topicLooseMatch(current.label, parent)) {
+        current = { label: parent, subtopics: [] };
+        trees.push(current);
+      }
+      if (child.length >= 3) current.subtopics.push(child);
+      continue;
+    }
+
+    if (bold && !subBullet) {
+      const label = bold[1].trim();
+      if (label.length >= 3) {
+        current = { label, subtopics: [] };
+        trees.push(current);
+      }
+      continue;
+    }
+
+    if (subBullet && current) {
+      const sub = subBullet[1].replace(/\*\*/g, '').trim();
+      if (sub.length >= 3 && !topicLooseMatch(sub, current.label)) current.subtopics.push(sub);
+    } else if (topBullet) {
+      const raw = topBullet[1].replace(/\*\*/g, '').trim();
+      const childMatch = raw.match(/^(.+?)\s*[-–—:]>\s*(.+)$/);
+      if (childMatch) {
+        const parent = childMatch[1].trim();
+        const child = childMatch[2].trim();
+        if (!current || !topicLooseMatch(current.label, parent)) {
+          current = { label: parent, subtopics: [] };
+          trees.push(current);
+        }
+        if (child.length >= 3) current.subtopics.push(child);
+      } else if (raw.length >= 3) {
+        current = { label: raw.split(/\s*[-–—:]\s/)[0].trim(), subtopics: [] };
+        trees.push(current);
+      }
+    }
+  }
+
+  return trees
+    .map((t) => ({
+      label: polishDeepDiveLabel(t.label, language),
+      subtopics: [...new Set(t.subtopics.map((s) => polishDeepDiveLabel(s, language)).filter((s) => s && s.length >= 3))].slice(0, 6)
+    }))
+    .filter((t) => t.label && t.label.length >= 3)
+    .slice(0, 6);
+}
+
+function extractProgrammingSubtopics(extracted = '') {
+  const subs = new Set();
+  const text = String(extracted || '').slice(0, 120000);
+  for (const m of text.matchAll(/\b(def|class)\s+([A-Za-z_][A-Za-z0-9_]*)/g)) {
+    subs.add(`${m[1]} ${m[2]}`);
+  }
+  for (const m of text.matchAll(/\b(import|from)\s+([A-Za-z_][A-Za-z0-9_.]*)/g)) {
+    if (m[2] && !m[2].startsWith('.')) subs.add(`import ${m[2].split('.')[0]}`);
+  }
+  for (const m of text.matchAll(/```(\w+)?/g)) {
+    if (m[1] && m[1].length <= 12) subs.add(m[1]);
+  }
+  return [...subs].slice(0, 8);
+}
+
+function mergeTopicTrees(baseTree = [], overlayTree = []) {
+  const out = [...baseTree];
+  for (const ov of overlayTree) {
+    const hit = out.find((t) => topicLooseMatch(t.label, ov.label));
+    if (hit) {
+      const merged = new Set([...(hit.subtopics || []), ...(ov.subtopics || [])]);
+      hit.subtopics = [...merged].slice(0, 6);
+    } else {
+      out.push({
+        id: slugify(ov.label) || `theme-${out.length + 1}`,
+        label: ov.label,
+        role: '',
+        subtopics: (ov.subtopics || []).slice(0, 6)
+      });
+    }
+  }
+  return out.slice(0, 6);
+}
+
+function enrichStructureFromOverview(structure, overview = '', language = 'German') {
+  if (!overview?.trim()) return structure;
+  const parsed = parseOverviewSubtopicTree(overview, language);
+  if (!parsed.length) return structure;
+
+  const isGerman = language === 'German';
+  let topicTree = mergeTopicTrees(structure.topicTree || [], parsed.map((t, i) => ({
+    id: slugify(`${i + 1}-${t.label}`),
+    label: t.label,
+    role: i === 0 ? (isGerman ? 'Kernthema' : 'Core theme') : (isGerman ? 'Kernthema' : 'Core theme'),
+    subtopics: t.subtopics
+  })));
+
+  const deepDiveSections = buildDeepDiveSections({
+    focusTheme: structure.focusTheme || parsed[0]?.label,
+    topicTree,
+    recurringThemes: structure.recurringThemes || [],
+    prerequisites: structure.prerequisites || [],
+    language
+  });
+
+  return {
+    ...structure,
+    topicTree,
+    deepDiveSections,
+    deepDiveTopics: flattenDeepDiveSections(deepDiveSections)
+  };
+}
+
+function findDeepDiveTopicContext(structure, topic = '') {
+  const label = String(topic || '').trim();
+  if (!label || !structure) return { parent: '', isSubtopic: false };
+  for (const section of structure.deepDiveSections || []) {
+    for (const sub of section.subtopics || []) {
+      const subLabel = typeof sub === 'string' ? sub : sub.label;
+      if (subLabel === label || topicLooseMatch(subLabel, label)) {
+        return { parent: section.label, isSubtopic: true };
+      }
+    }
+    if (section.label === label || topicLooseMatch(section.label, label)) {
+      return { parent: '', isSubtopic: false };
+    }
+  }
+  for (const theme of structure.topicTree || []) {
+    for (const sub of theme.subtopics || []) {
+      const subLabel = typeof sub === 'string' ? sub : sub.label;
+      if (subLabel === label || topicLooseMatch(subLabel, label)) {
+        return { parent: theme.label, isSubtopic: true };
+      }
+    }
+  }
+  return { parent: '', isSubtopic: false };
+}
+
+function ensureLectureStructureFields(structure, { courseName, lecturePath, meta = {}, overview = '' }) {
   if (!structure || typeof structure !== 'object') return structure;
   const language = structure.language || meta.outputLanguage || 'German';
   let next = { ...structure, version: Math.max(structure.version || 0, 5), language };
+  if (overview) {
+    next = enrichStructureFromOverview(next, overview, language);
+  }
   if (!next.deepDiveSections?.length && (next.topicTree?.length || next.focusTheme)) {
     next.deepDiveSections = buildDeepDiveSections({
       focusTheme: next.focusTheme,
@@ -188,6 +384,9 @@ function ensureLectureStructureFields(structure, { courseName, lecturePath, meta
   }
   if (!next.courseSequence) {
     next.courseSequence = buildCourseSequenceEntry(courseName, lecturePath, meta);
+  }
+  if (!next.studyPath?.units?.length && (next.topicTree?.length || next.focusTheme)) {
+    next.studyPath = buildStudyPath(next, language);
   }
   return next;
 }
@@ -206,8 +405,12 @@ function readLectureListRow({ courseName, courseDir, lectureFolder }) {
   let lectureStructure = null;
   try { lectureStructure = JSON.parse(fs.readFileSync(structurePath, 'utf8')); } catch {}
   if (lectureStructure) {
-    lectureStructure = ensureLectureStructureFields(lectureStructure, { courseName, lecturePath, meta });
-    try { fs.writeFileSync(structurePath, JSON.stringify(lectureStructure, null, 2), 'utf8'); } catch {}
+    const before = JSON.stringify(lectureStructure);
+    const overview = safeRead(path.join(lecturePath, 'overview.md'));
+    lectureStructure = ensureLectureStructureFields(lectureStructure, { courseName, lecturePath, meta, overview });
+    if (JSON.stringify(lectureStructure) !== before) {
+      try { fs.writeFileSync(structurePath, JSON.stringify(lectureStructure, null, 2), 'utf8'); } catch {}
+    }
   }
 
   let deepDiveIndex = [];
@@ -237,7 +440,6 @@ function readLectureListRow({ courseName, courseDir, lectureFolder }) {
     lectureStructure,
     courseSequence,
     deepDiveIndex,
-    threadContext: buildLectureThreadContext(courseName, lecturePath),
     inferredProgress: meta.plannerStatus === 'done' ? 'done' : inferProgress(meta),
     hasSummary: fs.existsSync(path.join(lecturePath, 'summary.md')),
     hasConcepts: fs.existsSync(path.join(lecturePath, 'concepts.md')),
@@ -275,7 +477,12 @@ function readLectureDetails(lecturePath, courseName = '') {
   if (needsRebuild) {
     lectureStructure = buildLectureStructure({ courseName: courseName || meta.course || '', lecturePath, meta, overview, summary, concepts, extracted });
   } else {
-    lectureStructure = ensureLectureStructureFields(lectureStructure, { courseName: courseName || meta.course || '', lecturePath, meta });
+    lectureStructure = ensureLectureStructureFields(lectureStructure, {
+      courseName: courseName || meta.course || '',
+      lecturePath,
+      meta,
+      overview
+    });
   }
   try { fs.writeFileSync(structurePath, JSON.stringify(lectureStructure, null, 2), 'utf8'); } catch {}
 
@@ -288,12 +495,23 @@ function readLectureDetails(lecturePath, courseName = '') {
   let deepDiveIndex = [];
   try { deepDiveIndex = JSON.parse(fs.readFileSync(path.join(lecturePath, 'deep_dives', 'index.json'), 'utf8')); } catch {}
 
+  let aufgaben = safeJson(path.join(lecturePath, 'aufgaben.json'));
+  if (!aufgaben?.exercises?.length) {
+    const md = safeRead(path.join(lecturePath, 'aufgaben.md'));
+    if (md.trim()) aufgaben = { ...(aufgaben || {}), markdownFallback: md };
+  }
+  let aufgabenProgress = safeJson(path.join(lecturePath, 'aufgaben_progress.json')) || {};
+
   const lectureFolder = path.basename(lecturePath);
   const displayName = resolveLectureDisplayName(meta, lectureStructure, lectureFolder, courseName || meta.course || '');
   if (displayName && displayName !== meta.inferredLectureName) {
     meta.inferredLectureName = displayName;
     try { fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), 'utf8'); } catch {}
   }
+
+  const noteCards = loadNoteCards(lecturePath).cards || [];
+  const deepStudy = ensureDeepStudy(meta);
+  const coverage = computeDeepStudyCoverage(lectureStructure, deepStudy);
 
   return {
     summary,
@@ -302,14 +520,81 @@ function readLectureDetails(lecturePath, courseName = '') {
     quiz,
     notes,
     studyCard,
+    noteCards,
+    deepStudy,
+    deepStudyCoverage: coverage,
     lectureStructure,
     courseSequence: lectureStructure?.courseSequence || buildCourseSequenceEntry(courseName || meta.course || '', lecturePath, meta),
     deepDiveIndex,
+    aufgaben,
+    aufgabenProgress,
     meta,
     displayName,
     threadContext: buildLectureThreadContext(courseName || meta.course || '', lecturePath)
   };
 }
+
+ipcMain.handle('lecture:generateAufgaben', async (_, { lecturePath }) => {
+  const apiKey = store.get('apiKey');
+  if (!apiKey) return { success: false, error: 'Missing API key' };
+  try {
+    const summary = safeRead(path.join(lecturePath, 'summary.md'));
+    const concepts = safeRead(path.join(lecturePath, 'concepts.md'));
+    const overview = safeRead(path.join(lecturePath, 'overview.md'));
+    const extracted = safeRead(path.join(lecturePath, 'extracted.txt'));
+    const meta = safeJson(path.join(lecturePath, 'meta.json')) || {};
+    const { OpenAI } = require('openai');
+    const openai = new OpenAI({ apiKey });
+    const result = await generateAufgabenBundle({
+      openai,
+      model: getGenerationModel(),
+      lecturePath,
+      courseName: meta.course || '',
+      meta,
+      overview,
+      summary,
+      concepts,
+      extracted
+    });
+    if (!result.success) return result;
+    writeAufgabenFiles(lecturePath, result.aufgaben, result.markdown);
+    return { success: true, aufgaben: result.aufgaben };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+ipcMain.handle('lecture:loadAufgaben', (_, { lecturePath }) => {
+  try {
+    const aufgabenPath = path.join(lecturePath, 'aufgaben.json');
+    let aufgaben = safeJson(aufgabenPath);
+    const progress = safeJson(path.join(lecturePath, 'aufgaben_progress.json')) || {};
+    const markdown = safeRead(path.join(lecturePath, 'aufgaben.md'));
+    if (!aufgaben?.exercises?.length && markdown.trim()) {
+      return { success: true, aufgaben: null, markdown, progress };
+    }
+    if (!aufgaben?.exercises?.length) return { success: false, error: 'No exercises yet' };
+    return { success: true, aufgaben, markdown, progress };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+ipcMain.handle('lecture:saveAufgabenProgress', (_, { lecturePath, progress = {} }) => {
+  try {
+    if (!lecturePath) return { success: false, error: 'Missing lecture path' };
+    const progressPath = path.join(lecturePath, 'aufgaben_progress.json');
+    fs.writeFileSync(progressPath, JSON.stringify(progress, null, 2), 'utf8');
+    const metaPath = path.join(lecturePath, 'meta.json');
+    const meta = safeJson(metaPath) || {};
+    const doneCount = Object.values(progress).filter((s) => s === 'done').length;
+    meta.aufgabenProgress = { doneCount, updatedAt: new Date().toISOString() };
+    fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), 'utf8');
+    return { success: true, progress };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
 
 ipcMain.handle('vault:getLectures', (_, courseName) => {
   const vaultPath = store.get('vaultPath');
@@ -317,7 +602,9 @@ ipcMain.handle('vault:getLectures', (_, courseName) => {
   const courseDir = path.join(vaultPath, sanitizeName(courseName));
   if (!fs.existsSync(courseDir)) return [];
 
+  invalidateCourseRowsCache();
   try {
+    getEnrichedCourseRows(courseName);
     const lectures = fs.readdirSync(courseDir)
       .filter((f) => {
         try {
@@ -344,9 +631,11 @@ ipcMain.handle('vault:getLectures', (_, courseName) => {
         return aTime - bTime;
       });
 
+    invalidateCourseRowsCache();
     return lectures;
   } catch (err) {
     console.error('Error reading lectures:', err);
+    invalidateCourseRowsCache();
     return [];
   }
 });
@@ -428,6 +717,7 @@ ipcMain.handle('vault:getDashboard', () => {
           courseId: course.id,
           courseName: course.name,
           lectureId: folder,
+          lecturePath: path.join(courseDir, folder),
           lectureName: meta.inferredLectureName || folder.replace(/_/g, ' '),
           topicHints: Array.isArray(meta.topicHints) ? meta.topicHints.slice(0, 4) : [],
           lastActiveAt,
@@ -706,6 +996,194 @@ ipcMain.handle('lecture:saveNotes', (_, { lecturePath, notes }) => {
   }
 });
 
+ipcMain.handle('lecture:listNoteCards', (_, { lecturePath }) => {
+  try {
+    const data = loadNoteCards(lecturePath);
+    return { success: true, cards: data.cards || [] };
+  } catch (err) {
+    return { success: false, error: err.message, cards: [] };
+  }
+});
+
+ipcMain.handle('lecture:saveNoteCard', (_, payload) => {
+  try {
+    const { lecturePath, title, topic, parentTopic, mode, type, markdown, gist, bookmarked } = payload || {};
+    if (!lecturePath || !markdown?.trim()) return { success: false, error: 'Missing content' };
+    const data = loadNoteCards(lecturePath);
+    const card = {
+      id: `card-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      type: type || 'deep_dive',
+      title: String(title || topic || 'Deep dive').slice(0, 120),
+      topic: topic || '',
+      parentTopic: parentTopic || '',
+      mode: mode || 'explain',
+      markdown: String(markdown).trim(),
+      gist: String(gist || '').trim().slice(0, 280) || String(markdown).trim().split('\n').find((l) => l.trim())?.replace(/^#+\s*/, '').slice(0, 200) || '',
+      bookmarked: bookmarked !== false,
+      savedAt: new Date().toISOString()
+    };
+    data.cards = [card, ...(data.cards || [])].slice(0, 80);
+    saveNoteCardsFile(lecturePath, data);
+    return { success: true, card, cards: data.cards };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+ipcMain.handle('lecture:deleteNoteCard', (_, { lecturePath, cardId }) => {
+  try {
+    const data = loadNoteCards(lecturePath);
+    data.cards = (data.cards || []).filter((c) => c.id !== cardId);
+    saveNoteCardsFile(lecturePath, data);
+    return { success: true, cards: data.cards };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+ipcMain.handle('lecture:suggestDeepSteps', async (_, payload) => {
+  const apiKey = store.get('apiKey');
+  const {
+    lecturePath,
+    parentTopic = '',
+    currentTopic = '',
+    currentSubtopic = '',
+    deepDiveExcerpt = '',
+    subtopicExcerpt = ''
+  } = payload || {};
+  if (!lecturePath) return { success: false, error: 'Missing lecture path' };
+
+  try {
+    const meta = safeJson(path.join(lecturePath, 'meta.json')) || {};
+    const summary = safeRead(path.join(lecturePath, 'summary.md'));
+    const concepts = safeRead(path.join(lecturePath, 'concepts.md'));
+    const overview = safeRead(path.join(lecturePath, 'overview.md'));
+    const extracted = safeRead(path.join(lecturePath, 'extracted.txt'));
+    const lectureStructure = buildLectureStructure({
+      courseName: meta.course || '',
+      lecturePath,
+      meta,
+      overview,
+      summary,
+      concepts,
+      extracted
+    });
+    const deepStudy = ensureDeepStudy(meta);
+    const coverage = computeDeepStudyCoverage(lectureStructure, deepStudy);
+    const outputLanguage = readLectureLanguage(lecturePath, `${summary}\n${concepts}`);
+    const isGerman = outputLanguage === 'German';
+
+    if (coverage.complete && (deepStudy.explored || []).length >= 2) {
+      const msg = isGerman
+        ? 'Du hast die Kernthemen dieser Vorlesung gut abgedeckt. Diese Vorlesung ist für heute durch — wiederhole bei Bedarf in Notes oder markiere als erledigt.'
+        : 'You have covered the core topics for this lecture well. This lecture is done for now — revisit saved cards in Notes or mark the lecture complete.';
+      updateLectureMeta(lecturePath, (m) => {
+        const ds = ensureDeepStudy(m);
+        ds.complete = true;
+        ds.completeAt = new Date().toISOString();
+        ds.completeReason = msg;
+        ds.lastSuggestions = [];
+        m.deepStudy = ds;
+        return m;
+      });
+      const metaAfter = safeJson(path.join(lecturePath, 'meta.json')) || {};
+      return {
+        success: true,
+        complete: true,
+        completeMessage: msg,
+        suggestions: [],
+        coverage,
+        deepStudy: ensureDeepStudy(metaAfter)
+      };
+    }
+
+    if (!apiKey) {
+      const fallback = buildHeuristicDeepSuggestions(lectureStructure, deepStudy, {
+        parentTopic,
+        currentTopic,
+        currentSubtopic,
+        isGerman
+      });
+      persistDeepSuggestions(lecturePath, fallback, false, '');
+      const metaAfter = safeJson(path.join(lecturePath, 'meta.json')) || {};
+      return {
+        success: true,
+        suggestions: fallback,
+        complete: false,
+        coverage,
+        deepStudy: ensureDeepStudy(metaAfter),
+        offline: true
+      };
+    }
+
+    const { OpenAI } = require('openai');
+    const openai = new OpenAI({ apiKey });
+    const response = await openai.chat.completions.create({
+      model: getGenerationModel(),
+      messages: [
+        { role: 'system', content: buildDeepStepSuggestionPrompt(outputLanguage, readLectureProfile(lecturePath, extracted)) },
+        {
+          role: 'user',
+          content: JSON.stringify({
+            parentTopic,
+            currentTopic,
+            currentSubtopic,
+            coverage,
+            explored: (deepStudy.explored || []).slice(-16),
+            questions: (deepStudy.askLog || []).slice(-10),
+            allTopics: collectNavigableTopicLabels(lectureStructure),
+            deepDiveExcerpt: String(deepDiveExcerpt || '').slice(0, 4000),
+            subtopicExcerpt: String(subtopicExcerpt || '').slice(0, 4000)
+          }, null, 2)
+        }
+      ],
+      temperature: getTemperature(0.35),
+      max_tokens: 700
+    });
+    const parsed = parseJsonObject(response.choices?.[0]?.message?.content || '') || {};
+    let suggestions = Array.isArray(parsed.suggestions)
+      ? parsed.suggestions
+        .filter((s) => s?.label && String(s.label).trim().length >= 3)
+        .slice(0, 5)
+        .map((s) => ({
+          label: String(s.label).trim(),
+          reason: String(s.reason || '').trim().slice(0, 200)
+        }))
+      : [];
+
+    if (!suggestions.length) {
+      suggestions = buildHeuristicDeepSuggestions(lectureStructure, deepStudy, {
+        parentTopic,
+        currentTopic,
+        currentSubtopic,
+        isGerman
+      });
+    }
+
+    const complete = !!parsed.complete || (suggestions.length === 0 && coverage.ratio >= 0.85);
+    const completeMessage = complete
+      ? String(parsed.completeMessage || (isGerman
+        ? 'Diese Vorlesung ist durch — starke Abdeckung. Nutze Notes zum Wiederholen.'
+        : 'This lecture is complete — strong coverage. Use Notes to review.'))
+      : '';
+
+    persistDeepSuggestions(lecturePath, suggestions, complete, completeMessage);
+    const metaAfter = safeJson(path.join(lecturePath, 'meta.json')) || {};
+
+    return {
+      success: true,
+      suggestions,
+      complete,
+      completeMessage,
+      coverage,
+      deepStudy: ensureDeepStudy(metaAfter),
+      tokens: response.usage?.total_tokens || 0
+    };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
 ipcMain.handle('lecture:loadStudyCard', (_, { lecturePath }) => {
   try {
     if (!lecturePath) return { success: false, error: 'Missing lecture path' };
@@ -851,20 +1329,50 @@ function getTemperature(defaultValue) {
   return defaultValue;
 }
 
-async function runPdfProcess(event, { pdfPath, courseName }) {
+function resolveCourseForImport({ courseId, courseName } = {}) {
+  const courses = store.get('courses') || [];
+  if (courseId) {
+    const byId = courses.find((c) => c.id === courseId);
+    if (byId) return byId;
+  }
+  if (courseName) {
+    const byName = courses.find((c) => c.name === courseName);
+    if (byName) return byName;
+  }
+  return null;
+}
+
+async function runPdfProcess(event, { pdfPath, courseName, courseId }) {
   if (pdfProcessingActive) {
-    return { success: false, error: 'BUSY', message: 'Another PDF is already being processed.' };
+    const staleMs = Date.now() - (global.__studyAiPdfLockAt || 0);
+    if (staleMs > 45 * 60 * 1000) {
+      console.warn('Resetting stale PDF processing lock');
+      pdfProcessingActive = false;
+    } else {
+      return { success: false, error: 'BUSY', message: 'Another PDF is already being processed.' };
+    }
   }
   pdfProcessingActive = true;
+  global.__studyAiPdfLockAt = Date.now();
 
   const vaultPath = store.get('vaultPath');
   const apiKey = store.get('apiKey');
   const model = getGenerationModel();
+  const course = resolveCourseForImport({ courseId, courseName });
 
   if (!vaultPath || !apiKey) {
     pdfProcessingActive = false;
     return { success: false, error: 'Missing vault path or API key' };
   }
+  if (!course) {
+    pdfProcessingActive = false;
+    return {
+      success: false,
+      error: 'INVALID_COURSE',
+      message: 'Selected course was not found. Close the dialog and try again.'
+    };
+  }
+  const resolvedCourseName = course.name;
 
   const sendStatus = (status) => {
     try {
@@ -880,18 +1388,44 @@ async function runPdfProcess(event, { pdfPath, courseName }) {
     sendStatus({ step: 'extracting', message: 'Extracting text from PDF…' });
     const { extractedText, pdfBaseName, textForAI } = await extractPdfText(pdfPath);
 
-    const courseDir = path.join(vaultPath, sanitizeName(courseName));
+    const courseDir = path.join(vaultPath, sanitizeName(resolvedCourseName));
+    fs.mkdirSync(courseDir, { recursive: true });
+    pruneOrphanLectureDirs(courseDir);
     sendStatus({ step: 'analyzing', message: 'Analyzing lecture structure…' });
     const semanticLectureName = normalizeLectureName(pdfBaseName, extractedText);
-    const { lectureFolder, lectureDir, reused } = allocateUniqueLectureFolder(
+    const sourceFile = path.basename(pdfPath);
+    const pdfHash = hashFileSha256(pdfPath);
+
+    const duplicate = findDuplicateLecture(courseDir, {
+      pdfPath,
+      semanticLectureName,
+      pdfHash,
+      sourceFile,
+      courseName: resolvedCourseName
+    });
+    if (duplicate) {
+      const isGerman = chooseOutputLanguage(resolvedCourseName, extractedText, course) === 'German';
+      sendStatus({
+        step: 'done',
+        message: isGerman ? 'Bereits vorhanden — übersprungen' : 'Already imported — skipped'
+      });
+      return {
+        success: true,
+        skipped: true,
+        duplicate: true,
+        reason: duplicate.reason,
+        lectureId: duplicate.folder,
+        lectureName: duplicate.lectureName,
+        lectureDir: duplicate.path,
+        message: duplicate.message
+      };
+    }
+
+    const { lectureFolder, lectureDir } = allocateUniqueLectureFolder(
       courseDir,
       semanticLectureName,
       pdfPath
     );
-
-    if (reused) {
-      sendStatus({ step: 'writing', message: 'Updating existing lecture folder…' });
-    }
 
     fs.mkdirSync(lectureDir, { recursive: true });
     fs.copyFileSync(pdfPath, path.join(lectureDir, 'original.pdf'));
@@ -901,11 +1435,9 @@ async function runPdfProcess(event, { pdfPath, courseName }) {
     const { OpenAI } = require('openai');
     const openai = new OpenAI({ apiKey });
 
-    const courseMeta = (store.get('courses') || []).find((c) => c.name === courseName) || {};
-    const lectureProfile = courseMeta.courseType && courseMeta.courseType !== 'auto'
-      ? courseMeta.courseType
-      : detectLectureProfile(extractedText, courseName);
-    const outputLanguage = chooseOutputLanguage(courseName, extractedText, courseMeta);
+    const courseMeta = course;
+    const lectureProfile = resolveLectureProfile(courseMeta, extractedText, resolvedCourseName);
+    const outputLanguage = chooseOutputLanguage(resolvedCourseName, extractedText, courseMeta);
     let totalTokens = 0;
     let summaryResponse;
     let conceptsResponse;
@@ -1014,6 +1546,27 @@ async function runPdfProcess(event, { pdfPath, courseName }) {
       return { success: false, error: 'API_ERROR', message: 'Model returned empty quiz', lectureDir };
     }
 
+    sendStatus({ step: 'aufgaben', message: outputLanguage === 'German' ? 'Erstelle Übungsaufgaben…' : 'Building practice exercises…' });
+
+    let aufgabenBundle = null;
+    let aufgabenTokens = 0;
+    try {
+      aufgabenBundle = await generateAufgabenBundle({
+        openai,
+        model,
+        lecturePath: lectureDir,
+        courseName: resolvedCourseName,
+        meta: { course: resolvedCourseName, courseId: course.id, inferredLectureName: semanticLectureName, outputLanguage, lectureProfile },
+        overview: overviewContent,
+        summary: summaryContent,
+        concepts: conceptsContent,
+        extracted: extractedText
+      });
+      if (aufgabenBundle.success) aufgabenTokens = aufgabenBundle.tokens || 0;
+    } catch (aufgabenErr) {
+      console.warn('Aufgaben generation skipped:', aufgabenErr.message);
+    }
+
     sendStatus({ step: 'writing', message: 'Writing files to vault…' });
 
     fs.writeFileSync(path.join(lectureDir, 'summary.md'), summaryContent, 'utf8');
@@ -1025,15 +1578,16 @@ async function runPdfProcess(event, { pdfPath, courseName }) {
     const provisionalMeta = {
       processedAt: new Date().toISOString(),
       sourceFile: path.basename(pdfPath),
-      course: courseName,
+      course: resolvedCourseName,
+      courseId: course.id,
       inferredLectureName: semanticLectureName,
       outputLanguage,
       lectureProfile,
       topicHints: extractTopicHints(extractedText),
-      prerequisites: inferPrerequisiteHints(courseName, semanticLectureName, extractedText)
+      prerequisites: inferPrerequisiteHints(resolvedCourseName, semanticLectureName, extractedText)
     };
     let lectureStructure = buildLectureStructure({
-      courseName,
+      courseName: resolvedCourseName,
       lecturePath: lectureDir,
       meta: provisionalMeta,
       overview: overviewContent,
@@ -1046,7 +1600,7 @@ async function runPdfProcess(event, { pdfPath, courseName }) {
     const renameResult = await refineLectureStructureWithAI({
       openai,
       model,
-      courseName,
+      courseName: resolvedCourseName,
       meta: provisionalMeta,
       structure: lectureStructure,
       summary: summaryContent,
@@ -1060,17 +1614,40 @@ async function runPdfProcess(event, { pdfPath, courseName }) {
     if (renameResult.tokens) totalTokens += renameResult.tokens;
     fs.writeFileSync(path.join(lectureDir, 'lecture_structure.json'), JSON.stringify(lectureStructure, null, 2), 'utf8');
 
+    if (!aufgabenBundle?.success) {
+      try {
+        aufgabenBundle = await generateAufgabenBundle({
+          openai,
+          model,
+          lecturePath: lectureDir,
+          courseName: resolvedCourseName,
+          meta: { course: resolvedCourseName, courseId: course.id, inferredLectureName: semanticLectureName, outputLanguage, lectureProfile },
+          overview: overviewContent,
+          summary: summaryContent,
+          concepts: conceptsContent,
+          extracted: extractedText,
+          lectureStructure
+        });
+        if (aufgabenBundle.success) aufgabenTokens = aufgabenBundle.tokens || 0;
+      } catch (_) {}
+    }
+    if (aufgabenBundle?.success) {
+      writeAufgabenFiles(lectureDir, aufgabenBundle.aufgaben, aufgabenBundle.markdown);
+    }
+
     const displayLectureName = resolveLectureDisplayName(
-      { course: courseName, inferredLectureName: semanticLectureName, outputLanguage },
+      { course: resolvedCourseName, inferredLectureName: semanticLectureName, outputLanguage },
       lectureStructure,
       lectureFolder,
-      courseName
+      resolvedCourseName
     );
 
     const meta = {
       processedAt: new Date().toISOString(),
-      sourceFile: path.basename(pdfPath),
-      course: courseName,
+      sourceFile,
+      sourceSha256: pdfHash || undefined,
+      course: resolvedCourseName,
+      courseId: course.id,
       inferredLectureName: displayLectureName,
       sourceTitleFromFile: semanticLectureName,
       outputLanguage,
@@ -1082,8 +1659,8 @@ async function runPdfProcess(event, { pdfPath, courseName }) {
       focusTheme: lectureStructure.focusTheme,
       coreThemes: lectureStructure.coreThemes,
       courseSequence: lectureStructure.courseSequence,
-      prerequisites: lectureStructure.prerequisites?.length ? lectureStructure.prerequisites : inferPrerequisiteHints(courseName, semanticLectureName, extractedText),
-      threadContext: buildLectureThreadContext(courseName, lectureDir),
+      prerequisites: lectureStructure.prerequisites?.length ? lectureStructure.prerequisites : inferPrerequisiteHints(resolvedCourseName, semanticLectureName, extractedText),
+      threadContext: buildLectureThreadContext(resolvedCourseName, lectureDir),
       progress: 'not_started',
       activity: {
         openedCount: 0,
@@ -1096,8 +1673,9 @@ async function runPdfProcess(event, { pdfPath, courseName }) {
         concepts: conceptsResponse.usage?.total_tokens || 0,
         overview: overviewResponse.usage?.total_tokens || 0,
         quiz: quizResponse.usage?.total_tokens || 0,
+        aufgaben: aufgabenTokens,
         naming: renameResult.tokens || 0,
-        total: totalTokens
+        total: totalTokens + aufgabenTokens
       }
     };
 
@@ -1115,6 +1693,7 @@ async function runPdfProcess(event, { pdfPath, courseName }) {
       concepts: conceptsContent,
       overview: overviewContent,
       quiz: quizContent,
+      aufgaben: aufgabenBundle?.aufgaben || null,
       lectureStructure
     };
   } catch (err) {
@@ -1122,17 +1701,35 @@ async function runPdfProcess(event, { pdfPath, courseName }) {
     return { success: false, error: err.code || 'UNKNOWN_ERROR', message: err.message };
   } finally {
     pdfProcessingActive = false;
+    global.__studyAiPdfLockAt = 0;
+    invalidateCourseRowsCache();
   }
 }
 
 ipcMain.handle('pdf:analyze', async (_, { pdfPath }) => {
   try {
-    const { extractedText, pdfBaseName, textForAI } = await extractPdfText(pdfPath);
+    const pdfBaseName = path.basename(pdfPath, '.pdf');
     const courses = store.get('courses') || [];
+    let extractedText = '';
+    let textSample = '';
+    try {
+      const raced = await Promise.race([
+        extractPdfText(pdfPath),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('ANALYZE_TIMEOUT')), 10000))
+      ]);
+      extractedText = raced.extractedText || '';
+      textSample = raced.textForAI || '';
+    } catch (_) {
+      extractedText = '';
+      textSample = '';
+    }
 
-    const bestCourse = chooseSuggestedCourse(courses, `${pdfBaseName}\n${extractedText.slice(0, 4000)}`);
-    const cleanedName = normalizeLectureName(pdfBaseName, extractedText);
-    const topicHints = extractTopicHints(extractedText).slice(0, 6);
+    const haystack = `${pdfBaseName}\n${extractedText.slice(0, 4000)}`;
+    const bestCourse = chooseSuggestedCourse(courses, haystack);
+    const cleanedName = extractedText.length >= 50
+      ? normalizeLectureName(pdfBaseName, extractedText)
+      : pdfBaseName.replace(/_/g, ' ').trim();
+    const topicHints = extractedText.length >= 50 ? extractTopicHints(extractedText).slice(0, 6) : [];
 
     return {
       success: true,
@@ -1140,7 +1737,8 @@ ipcMain.handle('pdf:analyze', async (_, { pdfPath }) => {
       confidence: bestCourse?.confidence || 0,
       suggestedLectureName: cleanedName,
       topicHints,
-      previewText: textForAI.slice(0, 600)
+      previewText: textSample.slice(0, 600),
+      quickOnly: !extractedText.length
     };
   } catch (err) {
     return { success: false, error: err.message };
@@ -1155,45 +1753,63 @@ ipcMain.handle('lecture:generateOverview', async (_, { lecturePath }) => {
     return { success: false, error: 'Missing API key' };
   }
   try {
+    const meta = safeJson(path.join(lecturePath, 'meta.json')) || {};
     const summary = safeRead(path.join(lecturePath, 'summary.md'));
     const concepts = safeRead(path.join(lecturePath, 'concepts.md'));
+    const extracted = safeRead(path.join(lecturePath, 'extracted.txt'));
     const outputLanguage = readLectureLanguage(lecturePath, `${summary}\n${concepts}`);
     if (!summary && !concepts) {
       return { success: false, error: 'No lecture content available to generate overview' };
     }
+    const courseMeta = getCourseMetaByName(meta.course || '');
+    const lectureProfile = resolveLectureProfile(courseMeta, `${summary}\n${concepts}\n${extracted}`, meta.course || '');
     const { OpenAI } = require('openai');
     const openai = new OpenAI({ apiKey });
     const response = await openai.chat.completions.create({
       model: getGenerationModel(),
       messages: [
-        { role: 'system', content: buildRegenerateOverviewPrompt(outputLanguage) },
-        { role: 'user', content: `Summary:\n${summary}\n\nConcepts:\n${concepts}` }
+        { role: 'system', content: buildOverviewPrompt(outputLanguage, lectureProfile) },
+        { role: 'user', content: `Summary:\n${summary}\n\nConcepts:\n${concepts}\n\nSource excerpt:\n${extracted.slice(0, 24000)}` }
       ],
       temperature: getTemperature(0.2)
     });
     const overview = response.choices?.[0]?.message?.content || '';
     fs.writeFileSync(path.join(lecturePath, 'overview.md'), overview, 'utf8');
-    return { success: true, overview };
+
+    let structure = safeJson(path.join(lecturePath, 'lecture_structure.json'))
+      || buildLectureStructure({ courseName: meta.course || '', lecturePath, meta, overview, summary, concepts, extracted });
+    structure = enrichStructureFromOverview(structure, overview, outputLanguage);
+    structure = ensureLectureStructureFields(structure, { courseName: meta.course || '', lecturePath, meta, overview });
+    fs.writeFileSync(path.join(lecturePath, 'lecture_structure.json'), JSON.stringify(structure, null, 2), 'utf8');
+    invalidateCourseRowsCache();
+
+    return { success: true, overview, lectureStructure: structure, lectureProfile };
   } catch (err) {
     return { success: false, error: err.message };
   }
 });
 
-ipcMain.handle('lecture:generateDeepDive', async (_, { lecturePath, topic }) => {
+ipcMain.handle('lecture:generateDeepDive', async (_, { lecturePath, topic, mode = 'explain' }) => {
   const apiKey = store.get('apiKey');
   if (!apiKey) return { success: false, error: 'Missing API key' };
   if (!topic?.trim()) return { success: false, error: 'Missing topic' };
+  const diveMode = String(mode || 'explain').toLowerCase();
   try {
+    const meta = safeJson(path.join(lecturePath, 'meta.json')) || {};
     const summary = safeRead(path.join(lecturePath, 'summary.md'));
     const concepts = safeRead(path.join(lecturePath, 'concepts.md'));
     const overview = safeRead(path.join(lecturePath, 'overview.md'));
     const extracted = safeRead(path.join(lecturePath, 'extracted.txt'));
-    const lectureStructure = buildLectureStructure({ lecturePath, meta: safeJson(path.join(lecturePath, 'meta.json')) || {}, overview, summary, concepts, extracted });
+    const lectureStructure = buildLectureStructure({ courseName: meta.course || '', lecturePath, meta, overview, summary, concepts, extracted });
     const threadContext = buildLectureThreadContextFromMaterials(lecturePath, { overview, summary, concepts, extracted, lectureStructure });
     const lectureContent = `${formatLectureStructureForPrompt(lectureStructure)}\n\n${threadContext.markdown}\n\n${overview}\n\n${summary}\n\n${concepts}\n\n${extracted.slice(0, 30000)}`.trim();
     if (!lectureContent) return { success: false, error: 'No lecture materials available' };
     const outputLanguage = readLectureLanguage(lecturePath, lectureContent);
     const lectureProfile = readLectureProfile(lecturePath, lectureContent);
+    const topicCtx = findDeepDiveTopicContext(lectureStructure, topic);
+    const compareContext = diveMode === 'compare'
+      ? getPriorLectureMaterials(meta.course || '', lecturePath)
+      : '';
 
     const { OpenAI } = require('openai');
     const openai = new OpenAI({ apiKey });
@@ -1202,11 +1818,15 @@ ipcMain.handle('lecture:generateDeepDive', async (_, { lecturePath, topic }) => 
       messages: [
         {
           role: 'system',
-          content: buildDeepDivePrompt(outputLanguage, lectureProfile, topic)
+          content: buildDeepDivePromptForMode(outputLanguage, lectureProfile, topic, diveMode, compareContext, topicCtx)
         },
         {
           role: 'user',
-          content: `Topic: ${topic}\n\nLecture materials:\n${lectureContent}`
+          content: `Course profile: ${profileLabel(lectureProfile, outputLanguage)} (${lectureProfile})
+Topic: ${topic}${topicCtx.parent ? `\nParent theme: ${topicCtx.parent}` : ''}
+Mode: ${diveMode}
+
+Lecture materials:\n${lectureContent}`
         }
       ],
       temperature: getTemperature(0.3)
@@ -1217,28 +1837,40 @@ ipcMain.handle('lecture:generateDeepDive', async (_, { lecturePath, topic }) => 
     const topicSlug = slugify(topic);
     const deepDiveDir = path.join(lecturePath, 'deep_dives');
     fs.mkdirSync(deepDiveDir, { recursive: true });
-    const deepDivePath = path.join(deepDiveDir, `${topicSlug}.md`);
+    const deepDivePath = deepDiveModeFilePath(lecturePath, topicSlug, diveMode);
     fs.writeFileSync(deepDivePath, deepDive, 'utf8');
+    if (diveMode === 'explain') {
+      fs.writeFileSync(path.join(deepDiveDir, `${topicSlug}.md`), deepDive, 'utf8');
+    }
 
     const indexPath = path.join(deepDiveDir, 'index.json');
     let index = [];
     try { index = JSON.parse(fs.readFileSync(indexPath, 'utf8')); } catch {}
     const now = new Date().toISOString();
-    const existing = index.find((e) => e.slug === topicSlug);
-    if (existing) {
-      existing.topic = topic;
-      existing.updatedAt = now;
-    } else {
-      index.push({ slug: topicSlug, topic, createdAt: now, updatedAt: now, language: outputLanguage, lectureProfile });
+    let existing = index.find((e) => e.slug === topicSlug);
+    if (!existing) {
+      existing = { slug: topicSlug, topic, modes: {}, createdAt: now, language: outputLanguage, lectureProfile };
+      index.push(existing);
     }
+    existing.topic = topic;
+    existing.updatedAt = now;
+    existing.modes = existing.modes || {};
+    existing.modes[diveMode] = now;
     fs.writeFileSync(indexPath, JSON.stringify(index, null, 2), 'utf8');
-    return { success: true, topic, slug: topicSlug, deepDive };
+    const deepStudy = recordDeepStudyExplore(lecturePath, {
+      topic,
+      subtopic: '',
+      parentTopic: topicCtx.parent || '',
+      mode: diveMode,
+      slug: topicSlug
+    });
+    return { success: true, topic, slug: topicSlug, mode: diveMode, deepDive, deepStudy };
   } catch (err) {
     return { success: false, error: err.message };
   }
 });
 
-ipcMain.handle('lecture:generateSubtopicDive', async (_, { lecturePath, topicSlug, subtopic }) => {
+ipcMain.handle('lecture:generateSubtopicDive', async (_, { lecturePath, topicSlug, subtopic, parentTopic }) => {
   const apiKey = store.get('apiKey');
   if (!apiKey) return { success: false, error: 'Missing API key' };
   if (!subtopic?.trim()) return { success: false, error: 'Missing subtopic' };
@@ -1271,7 +1903,20 @@ ipcMain.handle('lecture:generateSubtopicDive', async (_, { lecturePath, topicSlu
     const subSlug = slugify(subtopic);
     const outPath = path.join(lecturePath, 'deep_dives', `${topicSlug}_sub_${subSlug}.md`);
     fs.writeFileSync(outPath, subtopicDive, 'utf8');
-    return { success: true, subtopic, subSlug, subtopicDive };
+    let parent = parentTopic || '';
+    try {
+      const index = JSON.parse(fs.readFileSync(path.join(lecturePath, 'deep_dives', 'index.json'), 'utf8'));
+      const hit = index.find((e) => e.slug === topicSlug);
+      if (hit?.topic) parent = parent || hit.topic;
+    } catch (_) {}
+    const deepStudy = recordDeepStudyExplore(lecturePath, {
+      topic: parent || subtopic,
+      subtopic,
+      parentTopic: parent,
+      mode: 'subtopic',
+      slug: topicSlug
+    });
+    return { success: true, subtopic, subSlug, subtopicDive, parentTopic: parent, deepStudy };
   } catch (err) {
     return { success: false, error: err.message };
   }
@@ -1445,7 +2090,8 @@ ipcMain.handle('lecture:delete', (_, { lecturePath }) => {
       return { success: false, error: 'Folder still exists after delete — check file permissions' };
     }
 
-    return { success: true };
+    invalidateCourseRowsCache();
+    return { success: true, deletedPath: resolvedLecture };
   } catch (err) {
     return { success: false, error: err.message };
   }
@@ -1486,7 +2132,9 @@ ipcMain.handle('lecture:askQuick', async (_, { lecturePath, question, activeTab,
     }
     const outputLanguage = readLectureLanguage(lecturePath, combined);
     if (!apiKey) {
-      return { success: true, answer: buildOfflineLectureAnswer(q, combined, outputLanguage) };
+      const answer = buildOfflineLectureAnswer(q, combined, outputLanguage);
+      const deepStudy = recordDeepStudyQuestion(lecturePath, q, activeTab);
+      return { success: true, answer, deepStudy };
     }
     const { OpenAI } = require('openai');
     const openai = new OpenAI({ apiKey });
@@ -1507,7 +2155,8 @@ ipcMain.handle('lecture:askQuick', async (_, { lecturePath, question, activeTab,
     });
     const answer = response.choices?.[0]?.message?.content?.trim() || '';
     if (!answer) return { success: false, error: 'Empty answer from model' };
-    return { success: true, answer };
+    const deepStudy = recordDeepStudyQuestion(lecturePath, q, activeTab);
+    return { success: true, answer, deepStudy };
   } catch (err) {
     return { success: false, error: err.message };
   }
@@ -1533,6 +2182,7 @@ async function refineLectureStructureWithAI({ openai, model, courseName, meta, s
       courseName,
       language: outputLanguage,
       profile: lectureProfile,
+      profileLabel: profileLabel(lectureProfile, outputLanguage),
       currentFocus: structure.focusTheme,
       currentCoreThemes: structure.coreThemes || [],
       currentDeepDiveTopics: (structure.deepDiveTopics || []).map(t => ({ label: t.label, role: t.role, parent: t.parent || '', why: t.why || '' })),
@@ -1541,7 +2191,7 @@ async function refineLectureStructureWithAI({ openai, model, courseName, meta, s
     const response = await openai.chat.completions.create({
       model,
       messages: [
-        { role: 'system', content: buildTopicRenamingPrompt(outputLanguage) },
+        { role: 'system', content: buildTopicRenamingPrompt(outputLanguage, lectureProfile) },
         { role: 'user', content: `Candidate topic JSON:\n${JSON.stringify(candidatePayload, null, 2)}\n\nConcepts layer:\n${concepts.slice(0, 14000)}\n\nOverview:\n${overview.slice(0, 9000)}\n\nSummary excerpt:\n${summary.slice(0, 8000)}\n\nSource excerpt:\n${extracted.slice(0, 16000)}` }
       ],
       temperature: getTemperature(0.12),
@@ -1549,7 +2199,8 @@ async function refineLectureStructureWithAI({ openai, model, courseName, meta, s
     });
     const raw = response.choices?.[0]?.message?.content || '';
     const parsed = parseJsonObject(raw);
-    const refined = applySemanticTopicNaming(structure, parsed, { outputLanguage, courseName, meta, concepts, overview, summary, extracted });
+    let refined = applySemanticTopicNaming(structure, parsed, { outputLanguage, courseName, meta, concepts, overview, summary, extracted });
+    if (refined && overview) refined = enrichStructureFromOverview(refined, overview, outputLanguage);
     return { structure: refined || structure, tokens: response.usage?.total_tokens || 0 };
   } catch (err) {
     console.warn('Topic renaming fallback:', err.message);
@@ -1557,18 +2208,28 @@ async function refineLectureStructureWithAI({ openai, model, courseName, meta, s
   }
 }
 
-function buildTopicRenamingPrompt(language) {
+function buildTopicRenamingPrompt(language, profile = 'conceptual') {
   const isGerman = language === 'German';
-  return `You are StudyAI's concept naming filter. Your only job is to prune and rename lecture topic candidates into a small, trustworthy study-topic set. Write labels in ${language}. Return strict JSON only.
+  const profileRules = profile === 'programming'
+    ? (isGerman
+      ? '- PROGRAMMIERUNG: Mindestens 2 Kernthemen mit je 2–5 Unterthemen (z. B. def foo, Klassen, Schleifen, Fehler). Unterthemen = konkrete Code-Bausteine aus der Vorlesung, nicht abstrakte CS-Theorie.'
+      : '- PROGRAMMING: At least 2 core themes with 2–5 subtopics each (e.g. def foo, classes, loops, bugs). Subtopics = concrete code pieces from the lecture, not abstract CS theory.')
+    : profile === 'math_stats'
+      ? (isGerman
+        ? '- MATHE/STATISTIK: Kernthemen + Unterthemen für Formeln, Verfahren, Annahmen.'
+        : '- MATH/STATS: Core themes + subtopics for formulas, procedures, assumptions.')
+      : (isGerman
+        ? '- Mindestens 1 Kernthema mit 2–4 Unterthemen, wenn die Vorlesung das hergibt.'
+        : '- At least 1 core theme with 2–4 subtopics when the lecture supports it.');
+
+  return `You are StudyAI's concept naming filter. Prune and rename lecture topics into a hierarchical study set. Write labels in ${language}. Return strict JSON only.
 
 Rules:
-- Use the Concepts layer as the strongest evidence.
-- Remove university/faculty/department/semester/admin/logistics/schedule/course-outline/person names unless conceptually central.
-- Remove malformed fragments, partial phrases, vague labels, and duplicate variants.
-- Prefer 3 to 6 final topics total.
-- Labels must be short, human, sortable, and study-useful.
-- Do not invent topics absent from the lecture materials.
-- Collapse duplicates into one clearer label.
+- Use Concepts and Overview (Unterthemen/Subtopics) as strongest evidence.
+- Remove admin/logistics/person names unless conceptually central.
+- Prefer 3–6 topics total with clear parent/child links.
+- Labels must be short and study-useful; do not invent topics absent from materials.
+${profileRules}
 - For German lectures, labels and why-text must be German.
 
 JSON schema:
@@ -1641,7 +2302,8 @@ function applySemanticTopicNaming(structure, parsed, ctx = {}) {
     coreThemes: coreThemes.length ? coreThemes : [focusTheme],
     topicTree: topicTree.length ? topicTree : [{ id: slugify(focusTheme), label: focusTheme, role: finalTopics[0].role, subtopics: finalTopics.slice(1, 4).map(t => t.label) }],
     navigableTopics: uniqueTopicObjects(navigableTopics).slice(0, 8),
-    deepDiveTopics: finalTopics
+    deepDiveTopics: finalTopics,
+    studyPath: buildStudyPath({ topicTree, courseSequence: structure.courseSequence, recurringThemes: structure.recurringThemes, focusTheme }, language)
   };
 }
 
@@ -1720,6 +2382,15 @@ ${extracted.slice(0, 22000)}`);
     };
   }).filter(theme => scoreTopicCandidate(theme.label, { raw: theme.label, source: 'final', language, courseName, meta, extracted }) >= 4);
 
+  const courseMetaForProfile = getCourseMetaByName(courseName || meta.course || '');
+  const lectureProfile = resolveLectureProfile(courseMetaForProfile, extracted, courseName || meta.course || '');
+  if (lectureProfile === 'programming') {
+    const codeSubs = extractProgrammingSubtopics(extracted);
+    if (codeSubs.length && topicTree.length) {
+      topicTree[0].subtopics = dedupeTopicLabels([...(topicTree[0].subtopics || []), ...codeSubs]).slice(0, 6);
+    }
+  }
+
   const finalLabels = dedupeTopicLabels([focusTheme, ...topicTree.flatMap(t => [t.label, ...(t.subtopics || [])])]).filter(label => scoreTopicCandidate(label, { raw: label, source: 'final', language, courseName, meta, extracted }) >= 4);
   const recurringThemes = findRecurringThemesForLecture(courseName || meta.course || '', lecturePath, finalLabels, language, meta.inferredLectureName || '');
   const prerequisites = buildPrerequisiteModel(courseName || meta.course || '', lecturePath, finalLabels, meta, language);
@@ -1744,6 +2415,7 @@ ${extracted.slice(0, 22000)}`);
     courseSequence,
     prerequisites,
     recurringThemes,
+    studyPath: buildStudyPath({ topicTree, courseSequence, recurringThemes, focusTheme }, language),
     quality: {
       candidateCount: candidates.length,
       rejectedLegacyHints: (Array.isArray(meta.topicHints) ? meta.topicHints : []).filter(h => !finalLabels.some(label => topicLooseMatch(label, h))).slice(0, 12)
@@ -1887,8 +2559,7 @@ function enrichCourseLectureRows(courseName, rows = []) {
 }
 
 function buildCourseSequenceEntry(courseName, lecturePath, meta = {}) {
-  const rows = getCourseLectureRowsRaw(courseName);
-  const enriched = enrichCourseLectureRows(courseName, rows);
+  const enriched = getEnrichedCourseRows(courseName);
   const current = enriched.find((r) => r.path === lecturePath);
   if (!current) {
     return {
@@ -1907,10 +2578,16 @@ function buildCourseSequenceEntry(courseName, lecturePath, meta = {}) {
     hint: current.sequenceHint,
     buildsOn: current.buildsOn,
     previousName: current.previousLecture?.name || null,
+    previousPath: current.previousLecture?.path || null,
+    previousId: current.previousLecture?.id || null,
     nextName: current.nextLecture?.name || null,
+    nextPath: current.nextLecture?.path || null,
+    nextId: current.nextLecture?.id || null,
     arc: enriched.map((r) => ({
       index: r.sequenceIndex,
       name: r.name,
+      id: r.id,
+      path: r.path,
       active: r.path === lecturePath,
       buildsOn: r.buildsOn
     }))
@@ -2234,7 +2911,7 @@ function findRecurringThemesForLecture(courseName, lecturePath, topics = [], lan
       if (row.path === lecturePath) continue;
       if (currentLectureName && topicLooseMatch(row.name, currentLectureName)) continue;
       const score = titleMatchScore(row.searchText, topic.toLowerCase());
-      if (score > 0.05 || row.searchText.includes(String(topic).toLowerCase())) hits.push({ lectureId: row.id, lectureName: row.name, relation: row.isBefore ? (language === 'German' ? 'früher eingeführt' : 'introduced earlier') : (language === 'German' ? 'kommt später wieder' : 'returns later') });
+      if (score > 0.05 || row.searchText.includes(String(topic).toLowerCase())) hits.push({ lectureId: row.id, lecturePath: row.path, lectureName: row.name, relation: row.isBefore ? (language === 'German' ? 'früher eingeführt' : 'introduced earlier') : (language === 'German' ? 'kommt später wieder' : 'returns later') });
     }
     if (hits.length) out.push({ label: topic, hits: hits.slice(0, 4) });
   }
@@ -2242,7 +2919,7 @@ function findRecurringThemesForLecture(courseName, lecturePath, topics = [], lan
 }
 
 function getCourseLectureRowsLite(courseName, currentPath = '') {
-  const rows = enrichCourseLectureRows(courseName, getCourseLectureRowsRaw(courseName));
+  const rows = getEnrichedCourseRows(courseName);
   const currentIdx = rows.findIndex((r) => r.path === currentPath);
   return rows.map((row, idx) => {
     const lecturePath = row.path;
@@ -2301,6 +2978,183 @@ function formatLectureStructureForPrompt(structure = {}) {
   return lines.filter(Boolean).join('\n');
 }
 
+function loadNoteCards(lecturePath) {
+  return safeJson(path.join(lecturePath, 'note_cards.json')) || { cards: [] };
+}
+
+function saveNoteCardsFile(lecturePath, data) {
+  fs.writeFileSync(path.join(lecturePath, 'note_cards.json'), JSON.stringify(data, null, 2), 'utf8');
+}
+
+function ensureDeepStudy(meta = {}) {
+  if (!meta.deepStudy || typeof meta.deepStudy !== 'object') {
+    meta.deepStudy = {
+      explored: [],
+      askLog: [],
+      complete: false,
+      completeAt: null,
+      completeReason: '',
+      lastSuggestions: []
+    };
+  }
+  if (!Array.isArray(meta.deepStudy.explored)) meta.deepStudy.explored = [];
+  if (!Array.isArray(meta.deepStudy.askLog)) meta.deepStudy.askLog = [];
+  return meta.deepStudy;
+}
+
+function exploreKey(topic = '', subtopic = '') {
+  return `${topicCanonicalKey(topic)}::${topicCanonicalKey(subtopic || '')}`;
+}
+
+function collectNavigableTopicLabels(structure = {}) {
+  const out = [];
+  const sections = structure.deepDiveSections?.length
+    ? structure.deepDiveSections
+    : (structure.topicTree || []).map((t) => ({
+      label: t.label,
+      subtopics: (t.subtopics || []).map((s) => (typeof s === 'string' ? { label: s } : s))
+    }));
+  for (const sec of sections) {
+    if (sec?.label) out.push({ label: sec.label, parent: '', kind: 'theme' });
+    for (const sub of sec.subtopics || []) {
+      const label = typeof sub === 'string' ? sub : sub.label;
+      if (label) out.push({ label, parent: sec.label, kind: 'subtopic' });
+    }
+  }
+  return out;
+}
+
+function computeDeepStudyCoverage(structure = {}, deepStudy = {}) {
+  const all = collectNavigableTopicLabels(structure);
+  const themes = all.filter((t) => t.kind === 'theme');
+  const subs = all.filter((t) => t.kind === 'subtopic');
+  const exploredKeys = new Set((deepStudy.explored || []).map((e) => exploreKey(e.topic, e.subtopic)));
+  let coveredThemes = 0;
+  for (const th of themes) {
+    if (exploredKeys.has(exploreKey(th.label, ''))) coveredThemes += 1;
+  }
+  let coveredSubs = 0;
+  for (const st of subs) {
+    if (exploredKeys.has(exploreKey(st.label, '')) || exploredKeys.has(exploreKey(st.parent, st.label))) {
+      coveredSubs += 1;
+    }
+  }
+  const themeRatio = themes.length ? coveredThemes / themes.length : 0;
+  const subRatio = subs.length ? coveredSubs / Math.max(subs.length, 1) : 1;
+  const ratio = subs.length >= 3 ? themeRatio * 0.4 + subRatio * 0.6 : themeRatio;
+  const complete = ratio >= 0.82
+    && (deepStudy.explored || []).length >= Math.max(2, Math.min(themes.length, 4))
+    && (deepStudy.askLog || []).length >= 1;
+  return {
+    themesTotal: themes.length,
+    themesCovered: coveredThemes,
+    subtopicsTotal: subs.length,
+    subtopicsCovered: coveredSubs,
+    exploredCount: (deepStudy.explored || []).length,
+    questionsCount: (deepStudy.askLog || []).length,
+    ratio,
+    complete
+  };
+}
+
+function recordDeepStudyExplore(lecturePath, entry = {}) {
+  return updateLectureMeta(lecturePath, (meta) => {
+    const ds = ensureDeepStudy(meta);
+    const key = exploreKey(entry.topic, entry.subtopic);
+    const exists = ds.explored.some((e) => exploreKey(e.topic, e.subtopic) === key);
+    if (!exists) {
+      ds.explored.push({
+        topic: entry.topic || '',
+        subtopic: entry.subtopic || '',
+        parentTopic: entry.parentTopic || '',
+        mode: entry.mode || 'explain',
+        slug: entry.slug || '',
+        at: new Date().toISOString()
+      });
+      ds.explored = ds.explored.slice(-40);
+    }
+    if (ds.complete && !computeDeepStudyCoverage(
+      safeJson(path.join(lecturePath, 'lecture_structure.json')) || {},
+      ds
+    ).complete) {
+      ds.complete = false;
+      ds.completeAt = null;
+      ds.completeReason = '';
+    }
+    meta.deepStudy = ds;
+    return meta;
+  });
+}
+
+function recordDeepStudyQuestion(lecturePath, question = '', activeTab = '') {
+  return updateLectureMeta(lecturePath, (meta) => {
+    const ds = ensureDeepStudy(meta);
+    ds.askLog.push({
+      question: String(question).trim().slice(0, 500),
+      tab: activeTab || '',
+      at: new Date().toISOString()
+    });
+    ds.askLog = ds.askLog.slice(-30);
+    meta.deepStudy = ds;
+    return meta;
+  });
+}
+
+function persistDeepSuggestions(lecturePath, suggestions, complete, completeMessage) {
+  return updateLectureMeta(lecturePath, (meta) => {
+    const ds = ensureDeepStudy(meta);
+    ds.lastSuggestions = suggestions;
+    if (complete) {
+      ds.complete = true;
+      ds.completeAt = new Date().toISOString();
+      ds.completeReason = completeMessage || ds.completeReason;
+    }
+    meta.deepStudy = ds;
+    return meta;
+  });
+}
+
+function buildHeuristicDeepSuggestions(structure, deepStudy, ctx = {}) {
+  const { parentTopic, currentTopic, currentSubtopic, isGerman } = ctx;
+  const explored = new Set((deepStudy.explored || []).map((e) => exploreKey(e.topic, e.subtopic)));
+  const out = [];
+  for (const item of collectNavigableTopicLabels(structure)) {
+    const key = exploreKey(item.kind === 'subtopic' ? item.label : item.label, item.kind === 'subtopic' ? item.parent : '');
+    const altKey = exploreKey(item.label, '');
+    if (explored.has(key) || explored.has(altKey)) continue;
+    if (currentSubtopic && topicLooseMatch(item.label, currentSubtopic)) continue;
+    out.push({
+      label: item.label,
+      reason: isGerman
+        ? (item.kind === 'subtopic' ? `Vertieft „${parentTopic || currentTopic}“ weiter.` : 'Noch nicht bearbeitet.')
+        : (item.kind === 'subtopic' ? `Continue "${parentTopic || currentTopic}".` : 'Not explored yet.')
+    });
+    if (out.length >= 4) break;
+  }
+  return out;
+}
+
+function buildDeepStepSuggestionPrompt(language, profile = 'conceptual') {
+  const isGerman = language === 'German';
+  return `You are StudyAI's deep-study coach. Write in ${language}. Return strict JSON only.
+
+Schema:
+{
+  "complete": false,
+  "completeMessage": "only if complete is true — short congrats",
+  "suggestions": [
+    { "label": "next subtopic or angle label from lecture", "reason": "one sentence why now (gap, mistake, link to last dive or question)" }
+  ]
+}
+
+Rules:
+- Suggest 0–4 NEXT steps the student should deep-dive; labels must exist in allTopics or be tight children of currentTopic.
+- Use explored list and student questions to avoid repeats; prioritize gaps and confusion.
+- If coverage is strong (most themes/subtopics explored) AND questions show understanding, set complete true.
+- Profile: ${profile}. ${profile === 'programming' ? 'Prefer next code concepts, bugs, or trace tasks.' : ''}
+- Labels in ${language}.`;
+}
+
 function updateLectureMeta(lecturePath, mutate) {
   const metaPath = path.join(lecturePath, 'meta.json');
   const meta = safeJson(metaPath) || {};
@@ -2311,8 +3165,8 @@ function updateLectureMeta(lecturePath, mutate) {
 }
 
 function getCourseLectureRows(courseName) {
-  const raw = getCourseLectureRowsRaw(courseName);
-  return enrichCourseLectureRows(courseName, raw.map((row) => {
+  const enriched = getEnrichedCourseRows(courseName);
+  return enriched.map((row) => {
     const lecturePath = row.path;
     const meta = row.meta || {};
     const overview = safeRead(path.join(lecturePath, 'overview.md'));
@@ -2334,7 +3188,7 @@ function getCourseLectureRows(courseName) {
       prerequisites: lectureStructure?.prerequisites || (Array.isArray(meta.prerequisites) ? meta.prerequisites : []),
       progress: meta.plannerStatus === 'done' ? 'done' : inferProgress(meta)
     };
-  }));
+  });
 }
 
 function getLecturePrerequisites(lecturePath) {
@@ -2376,13 +3230,14 @@ function buildLectureThreadContext(courseName, lecturePath) {
     sequenceTotal: seq.total,
     buildsOn: current?.buildsOn || seq.buildsOn,
     summary,
-    previousLecture: prev ? { id: prev.id, name: prev.name, sequenceLabel: prev.sequenceLabel, progress: prev.progress, topicHints: prev.topicHints?.slice(0, 4) || [] } : null,
-    nextLecture: next ? { id: next.id, name: next.name, sequenceLabel: next.sequenceLabel, progress: next.progress, topicHints: next.topicHints?.slice(0, 4) || [] } : null,
+    previousLecture: prev ? { id: prev.id, name: prev.name, path: prev.path, sequenceLabel: prev.sequenceLabel, progress: prev.progress, topicHints: prev.topicHints?.slice(0, 4) || [] } : null,
+    nextLecture: next ? { id: next.id, name: next.name, path: next.path, sequenceLabel: next.sequenceLabel, progress: next.progress, topicHints: next.topicHints?.slice(0, 4) || [] } : null,
     prerequisites,
     currentTopics: topics.slice(0, 6),
     courseArc: rows.map((row) => ({
       id: row.id,
       name: row.name,
+      path: row.path,
       active: row.path === lecturePath,
       index: row.sequenceIndex,
       label: row.sequenceLabel,
@@ -2428,9 +3283,13 @@ function buildThreadHighlights(world) {
       courseId: course.id,
       courseName: course.name,
       lectureId: current.id,
+      lecturePath: current.path,
       lectureName: current.name,
+      label: ctx.threadName || current.name,
       threadName: ctx.threadName,
+      summary: ctx.summary || ctx.buildsOn || `${ctx.position || ''}`.trim(),
       position: ctx.position,
+      sequenceLabel: ctx.sequenceLabel,
       prerequisite: ctx.prerequisites?.[0] || 'Start by mapping the first concepts in this thread.',
       next: ctx.nextLecture?.name || 'Consolidate this lecture before adding harder material.',
       topics: current.topicHints?.slice(0, 4) || []
@@ -2871,9 +3730,138 @@ function sanitizeName(name) {
     .replace(/^_|_$/g, '');
 }
 
-/** One vault folder per PDF — never overwrite a different file with the same inferred title. */
+function hashFileSha256(filePath) {
+  try {
+    return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
+  } catch {
+    return null;
+  }
+}
+
+function listCourseLectureDirs(courseDir) {
+  if (!courseDir || !fs.existsSync(courseDir)) return [];
+  return fs.readdirSync(courseDir)
+    .filter((folder) => {
+      try {
+        return fs.statSync(path.join(courseDir, folder)).isDirectory();
+      } catch {
+        return false;
+      }
+    })
+    .map((folder) => ({ folder, dir: path.join(courseDir, folder) }));
+}
+
+function collectLectureIdentityKeys(dir, folder, courseName = '') {
+  const meta = safeJson(path.join(dir, 'meta.json')) || {};
+  const structure = safeJson(path.join(dir, 'lecture_structure.json')) || {};
+  const displayName = resolveLectureDisplayName(meta, structure, folder, courseName || meta.course || '');
+  const keys = new Set();
+  for (const raw of [
+    meta.inferredLectureName,
+    meta.sourceTitleFromFile,
+    structure.focusTheme,
+    folder.replace(/__/g, ' ').replace(/_/g, ' '),
+    displayName
+  ]) {
+    const key = topicCanonicalKey(raw);
+    if (key && key.length >= 4) keys.add(key);
+  }
+  const folderBase = folder.replace(/_\d+$/, '').replace(/__+/g, '_');
+  const folderKey = topicCanonicalKey(folderBase.replace(/_/g, ' '));
+  if (folderKey && folderKey.length >= 4) keys.add(folderKey);
+  return { meta, displayName, keys };
+}
+
+function isImportedLectureDir(dir) {
+  try {
+    const metaPath = path.join(dir, 'meta.json');
+    if (!fs.existsSync(metaPath) || fs.statSync(metaPath).size < 3) return false;
+    const meta = safeJson(metaPath) || {};
+    return !!(meta.processedAt || meta.sourceFile);
+  } catch {
+    return false;
+  }
+}
+
+/** Remove half-deleted folders (no meta) so re-import is not blocked by leftover PDFs. */
+function pruneOrphanLectureDirs(courseDir) {
+  for (const { folder, dir } of listCourseLectureDirs(courseDir)) {
+    if (isImportedLectureDir(dir)) continue;
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+      console.warn('Pruned orphan lecture folder:', folder);
+    } catch (err) {
+      console.warn('Could not prune orphan folder:', folder, err.message);
+    }
+  }
+}
+
+/** Only block when the same PDF (or filename) is already in the vault. Fuzzy title match is not enough — allows re-import after delete. */
+function findDuplicateLecture(courseDir, { pdfPath, semanticLectureName, pdfHash, sourceFile, courseName }) {
+  const semanticKey = topicCanonicalKey(semanticLectureName);
+  const stemKey = topicCanonicalKey(path.basename(pdfPath, path.extname(pdfPath)));
+
+  for (const { folder, dir } of listCourseLectureDirs(courseDir)) {
+    if (!isImportedLectureDir(dir)) continue;
+
+    const sig = collectLectureIdentityKeys(dir, folder, courseName);
+    const isGerman = (sig.meta.outputLanguage || '') === 'German';
+
+    if (sig.meta.sourceFile && sig.meta.sourceFile === sourceFile) {
+      return formatDuplicateHit(folder, dir, sig.displayName, 'same_filename', isGerman, sourceFile);
+    }
+
+    if (pdfHash) {
+      if (sig.meta.sourceSha256 === pdfHash) {
+        return formatDuplicateHit(folder, dir, sig.displayName, 'same_pdf', isGerman);
+      }
+      const originalPdf = path.join(dir, 'original.pdf');
+      if (fs.existsSync(originalPdf)) {
+        const existingHash = hashFileSha256(originalPdf);
+        if (existingHash && existingHash === pdfHash) {
+          return formatDuplicateHit(folder, dir, sig.displayName, 'same_pdf', isGerman);
+        }
+      }
+    }
+
+    // Exact same vault folder slug as this import would use (true re-drop of same lecture id)
+    const folderKey = topicCanonicalKey(folder.replace(/_\d+$/, '').replace(/_/g, ' '));
+    if (semanticKey && semanticKey.length >= 4 && folderKey === semanticKey) {
+      return formatDuplicateHit(folder, dir, sig.displayName, 'same_topic', isGerman);
+    }
+    const sourceTitleKey = topicCanonicalKey(sig.meta.sourceTitleFromFile || '');
+    if (stemKey && stemKey.length >= 4 && sourceTitleKey === stemKey) {
+      return formatDuplicateHit(folder, dir, sig.displayName, 'same_topic', isGerman);
+    }
+  }
+
+  return null;
+}
+
+function formatDuplicateHit(folder, dir, lectureName, reason, isGerman, sourceFile = '') {
+  const label = lectureName || folder.replace(/_/g, ' ');
+  const messages = {
+    same_filename: isGerman
+      ? `„${sourceFile}" ist bereits als „${label}" importiert.`
+      : `"${sourceFile}" is already imported as "${label}".`,
+    same_pdf: isGerman
+      ? `Diese PDF ist bereits vorhanden („${label}").`
+      : `This PDF is already in the vault ("${label}").`,
+    same_topic: isGerman
+      ? `Diese Vorlesung existiert noch im Vault („${label}"). Lösche sie in der App oder im Ordner, dann erneut importieren.`
+      : `This lecture still exists in the vault ("${label}"). Delete it in the app or folder, then import again.`
+  };
+  return {
+    folder,
+    path: dir,
+    lectureName: label,
+    reason,
+    message: messages[reason] || (isGerman ? `Bereits vorhanden: „${label}"` : `Already exists: "${label}"`)
+  };
+}
+
+/** One vault folder per new PDF. Duplicates are rejected before this runs. */
 function allocateUniqueLectureFolder(courseDir, semanticLectureName, sourcePdfPath) {
-  const sourceFile = path.basename(sourcePdfPath);
   const sourceStem = sanitizeName(path.basename(sourcePdfPath, path.extname(sourcePdfPath)));
   const semantic = sanitizeName(semanticLectureName) || sourceStem || 'Lecture';
 
@@ -2889,11 +3877,6 @@ function allocateUniqueLectureFolder(courseDir, semanticLectureName, sourcePdfPa
   let folder = baseKey;
   let n = 2;
   while (fs.existsSync(path.join(courseDir, folder))) {
-    const existingDir = path.join(courseDir, folder);
-    const meta = safeJson(path.join(existingDir, 'meta.json')) || {};
-    if (meta.sourceFile === sourceFile) {
-      return { lectureFolder: folder, lectureDir: existingDir, reused: true };
-    }
     folder = `${baseKey}_${n}`;
     n += 1;
     if (n > 80) {
@@ -2902,7 +3885,7 @@ function allocateUniqueLectureFolder(courseDir, semanticLectureName, sourcePdfPa
     }
   }
 
-  return { lectureFolder: folder, lectureDir: path.join(courseDir, folder), reused: false };
+  return { lectureFolder: folder, lectureDir: path.join(courseDir, folder) };
 }
 
 function safeRead(filePath) {
@@ -3199,23 +4182,126 @@ function buildStudyCardPrompt(language) {
 
 function detectLectureProfile(text = '', courseName = '') {
   const sample = `${courseName}\n${text}`.slice(0, 30000).toLowerCase();
+  const nameHint = sample.slice(0, 500);
   const mathSignals = (sample.match(/(σ|μ|∑|∫|p\(|z-score|varianz|standardabweich|regression|hypothese|konfidenz|matrix|ableitung|integral|gleichung|formel|stichprobe)/g) || []).length;
+  const codeSignals = (sample.match(/\b(def |class |import |function |return |python|javascript|typescript|array|loop|debug|syntax|variable|print\(|console\.|numpy|pandas|git)\b/g) || []).length;
+  const psychSignals = (sample.match(/\b(psychologie|psychology|studie|hypothese|experiment|kognition|verhalten|theorie|modell|skala|messung|stichprobe)\b/g) || []).length;
   const methodSignals = (sample.match(/\b(step|schritt|verfahren|algorithm|method|ablauf|berechne|bestimme|wende an|compute|calculate)\b/g) || []).length;
   const conceptualSignals = (sample.match(/\b(theory|theorie|definition|begriff|konzept|modell|framework|history|geschichte)\b/g) || []).length;
   const readingSignals = (sample.match(/\b(chapter|kapitel|paper|artikel|literatur|reading|essay|textanalyse)\b/g) || []).length;
 
+  if (/python|programm|informatik|software|coding|gpt|java|javascript|typescript|c\+\+/.test(nameHint) && codeSignals >= 2) return 'programming';
+  if (codeSignals >= 5) return 'programming';
   if (mathSignals >= 6) return 'math_stats';
+  if (psychSignals >= 5 && psychSignals >= mathSignals) return 'psychology';
   if (methodSignals >= conceptualSignals + 3) return 'applied_methods';
   if (readingSignals >= 5) return 'reading_heavy';
   return 'conceptual';
 }
 
+function resolveLectureProfile(courseMeta = {}, extractedText = '', courseName = '') {
+  const t = String(courseMeta.courseType || 'auto').toLowerCase();
+  if (t === 'math' || t === 'math_stats') return 'math_stats';
+  if (t === 'statistics' || t === 'stats') return 'math_stats';
+  if (t === 'programming' || t === 'code') return 'programming';
+  if (t === 'psychology' || t === 'psych') return 'psychology';
+  if (t === 'applied_methods' || t === 'methods') return 'applied_methods';
+  if (t === 'reading' || t === 'reading_heavy') return 'reading_heavy';
+  if (t === 'conceptual') return 'conceptual';
+  return detectLectureProfile(extractedText, courseName);
+}
+
 function readLectureProfile(lecturePath, fallbackText = '') {
   try {
-    const meta = JSON.parse(fs.readFileSync(path.join(lecturePath, 'meta.json'), 'utf8'));
-    if (meta.lectureProfile) return meta.lectureProfile;
+    const meta = safeJson(path.join(lecturePath, 'meta.json')) || {};
+    const courseMeta = getCourseMetaByName(meta.course || '');
+    const merged = { ...courseMeta, ...meta, courseType: courseMeta.courseType || meta.courseType };
+    if (meta.lectureProfile && merged.courseType === 'auto') return meta.lectureProfile;
+    return resolveLectureProfile(merged, fallbackText, meta.course || '');
   } catch {}
   return detectLectureProfile(fallbackText, '');
+}
+
+function profileLabel(profile, language = 'German') {
+  const isGerman = language === 'German';
+  const map = {
+    programming: isGerman ? 'Programmierung' : 'Programming',
+    math_stats: isGerman ? 'Mathematik/Statistik' : 'Math/Statistics',
+    psychology: isGerman ? 'Psychologie' : 'Psychology',
+    applied_methods: isGerman ? 'Methoden' : 'Applied methods',
+    reading_heavy: isGerman ? 'Lesestoff' : 'Reading-heavy',
+    conceptual: isGerman ? 'Konzeptuell' : 'Conceptual'
+  };
+  return map[profile] || map.conceptual;
+}
+
+function buildStudyPath(structure = {}, language = 'German') {
+  const isGerman = language === 'German';
+  const seq = structure.courseSequence || {};
+  const units = (structure.topicTree || []).slice(0, 4).map((theme, i) => ({
+    id: theme.id || `unit-${i + 1}`,
+    label: theme.label,
+    subtopics: (theme.subtopics || []).slice(0, 3),
+    order: i + 1,
+    steps: [
+      { id: 'explain', label: isGerman ? 'Verstehen' : 'Understand', tab: 'deepDive', mode: 'explain' },
+      { id: 'example', label: isGerman ? 'Beispiel' : 'Example', tab: 'deepDive', mode: 'example' },
+      { id: 'practice', label: isGerman ? 'Üben' : 'Practice', tab: 'aufgaben' }
+    ]
+  }));
+  const courseLinks = [];
+  if (seq.previousName) {
+    courseLinks.push({
+      type: 'buildsOn',
+      label: seq.buildsOn || (isGerman ? `Baut auf „${seq.previousName}" auf` : `Builds on “${seq.previousName}”`),
+      priorLectureName: seq.previousName,
+      priorLecturePath: seq.previousPath || null,
+      priorLectureId: seq.previousId || null,
+      tab: 'overview',
+      hint: isGerman ? 'Zuerst kurz die vorherige Vorlesung in Overview wiederholen' : 'Skim the previous lecture overview first'
+    });
+  }
+  for (const r of (structure.recurringThemes || []).slice(0, 4)) {
+    for (const hit of (r.hits || []).slice(0, 2)) {
+      courseLinks.push({
+        type: 'recurring',
+        label: r.label,
+        priorLectureName: hit.lectureName,
+        priorLecturePath: hit.lecturePath || null,
+        priorLectureId: hit.lectureId || null,
+        relation: hit.relation || '',
+        tab: 'concepts'
+      });
+    }
+  }
+  const intro = units.length
+    ? (isGerman
+      ? `${seq.label || 'Diese Vorlesung'}: ${units.length} Kernthemen nacheinander lernen — jedes mit Verstehen → Beispiel → Üben.`
+      : `${seq.label || 'This lecture'}: learn ${units.length} core units in order — understand → example → practice.`)
+    : '';
+  return { units, courseLinks, intro };
+}
+
+function getPriorLectureMaterials(courseName, lecturePath) {
+  const rows = getEnrichedCourseRows(courseName);
+  const idx = rows.findIndex((r) => r.path === lecturePath);
+  if (idx <= 0) return '';
+  const prev = rows[idx - 1];
+  const pPath = prev.path;
+  const overview = safeRead(path.join(pPath, 'overview.md')).slice(0, 6000);
+  const concepts = safeRead(path.join(pPath, 'concepts.md')).slice(0, 6000);
+  const structure = safeJson(path.join(pPath, 'lecture_structure.json'));
+  return [
+    `Previous lecture: ${prev.name} (${prev.sequenceLabel || ''})`,
+    structure?.focusTheme ? `Focus: ${structure.focusTheme}` : '',
+    overview,
+    concepts
+  ].filter(Boolean).join('\n\n');
+}
+
+function deepDiveModeFilePath(lecturePath, slug, mode = 'explain') {
+  const safeMode = String(mode || 'explain').replace(/[^a-z0-9_-]/gi, '');
+  return path.join(lecturePath, 'deep_dives', `${slug}__${safeMode || 'explain'}.md`);
 }
 
 function groundingRules() {
@@ -3232,12 +4318,18 @@ function mathFormattingRulesShort() {
 
 function buildSummaryPrompt(language, profile) {
   const isGerman = language === 'German';
-  const base = `You are a study assistant for university students. Write in ${language}. ${groundingRules()}`;
+  const base = `You are a study assistant for university students. Write in ${language}. ${groundingRules()} Teach ONE coherent narrative — not a topic list. Max 4 central ideas; put examples under those ideas.`;
   const headings = isGerman
     ? `Use German headings: ## Gesamtzusammenfassung, ## Aufbau der Vorlesung, ## Zentrale Inhalte, ## Was man behalten sollte, ## Verbindung zur Kurslogik.`
     : `Use headings: ## Whole-lecture summary, ## Lecture structure, ## Main content, ## What to retain, ## Connection to the course logic.`;
   if (profile === 'math_stats') {
     return `${base} ${mathFormattingRules()} The Summary is NOT the map; it is the content-rich explanation of the whole lecture. ${headings} Explain notation and procedures in lecture order, including assumptions, applications, and typical errors.`;
+  }
+  if (profile === 'programming') {
+    return `${base} ${headings} Trace what the code/demo in the lecture actually does, in execution order. Name inputs, outputs, control flow, and one concrete run-through. Avoid abstract CS jargon not in the PDF.`;
+  }
+  if (profile === 'psychology') {
+    return `${base} ${headings} Explain constructs, how they are measured/operationalized, and how claims are supported. Separate correlation vs causation when relevant.`;
   }
   if (profile === 'applied_methods') {
     return `${base} The Summary is NOT the map; it is the content-rich explanation of the whole lecture. ${headings} Explain the methods, decision rules, execution logic, inputs/outputs, and edge cases in lecture order.`;
@@ -3252,7 +4344,13 @@ function buildConceptPrompt(language, profile) {
   const isGerman = language === 'German';
   const g = `Write in ${language}. ${groundingRules()} Use markdown. Concepts must come from the lecture's real Fokusthema / focus theme, Kernthemen / core themes, and Unterthemen / subtopics. Do not output generic keywords. Keep concept names in the lecture language.`;
   if (profile === 'math_stats') {
-    return `${g} ${mathFormattingRules()} ${isGerman ? 'Use German headings: ## Konzeptuelle Bausteine, ## Symbole & Objekte, ## Methoden und Voraussetzungen, ## Beziehungen im Kursfaden, ## Wiederkehrende Themen.' : 'Use headings: ## Conceptual building blocks, ## Symbols & objects, ## Methods and prerequisites, ## Relationships in the course thread, ## Recurring themes.'} For each concept, explain its role, prerequisite, and what it enables.`;
+    return `${g} ${mathFormattingRules()} ${isGerman ? 'Use German headings: ## Konzeptuelle Bausteine, ## Symbole & Objekte, ## Methoden und Voraussetzungen, ## Beziehungen im Kursfaden, ## Wiederkehrende Themen.' : 'Use headings: ## Conceptual building blocks, ## Symbols & objects, ## Methods and prerequisites, ## Relationships in the course thread, ## Recurring themes.'} For each concept: definition → when to use → typical mistake → link to prior lecture if implied.`;
+  }
+  if (profile === 'programming') {
+    return `${g} ${isGerman ? 'Use German headings: ## Bausteine, ## Syntax & Muster, ## Ablauf einer Ausführung, ## Typische Fehler, ## Bezug zu früheren Vorlesungen.' : 'Use headings: ## Building blocks, ## Syntax & patterns, ## Execution flow, ## Typical bugs, ## Link to earlier lectures.'} Per concept: what it does in code, prerequisite idea, common bug.`;
+  }
+  if (profile === 'psychology') {
+    return `${g} ${isGerman ? 'Use German headings: ## Konstrukte, ## Operationalisierung, ## Zusammenhänge, ## Grenzen der Evidenz, ## Bezug im Kurs.' : 'Use headings: ## Constructs, ## Operationalization, ## Relationships, ## Limits of evidence, ## Place in course.'} Per construct: definition, how measured, what it explains, limitation.`;
   }
   return `${g} ${isGerman ? 'Use German headings: ## Konzeptuelle Bausteine, ## Kernthemen und Unterthemen, ## Beziehungen, ## Voraussetzungen vs. Erweiterungen, ## Wiederkehrende Themen.' : 'Use headings: ## Conceptual building blocks, ## Core themes and subtopics, ## Relationships, ## Prerequisites vs extensions, ## Recurring themes.'} For each concept, explain why it belongs to the lecture structure and how it connects to other concepts.`;
 }
@@ -3349,23 +4447,203 @@ function buildLectureQuizPrompt(language, profile, count) {
 }
 
 function buildDeepDivePrompt(language, profile, topic) {
-  const languageRule = `Write in ${language}. Keep headings, topic labels, and explanations in ${language} unless the source term itself is in another language. Do not translate named technical terms when the lecture uses them as labels; define them in ${language}.`;
-  const adaptiveRules = `You are a strong lecturer teaching "${topic}" — not filling a generic worksheet. Choose the best teaching shape for THIS topic using ONLY the lecture materials and supplied lecture-structure context. Use markdown ## headings you invent (4–8 sections). Include only sections that genuinely help: e.g. intuition, definitions, notation, worked steps, contrasts, course-thread placement, prerequisites, assumptions, typical mistakes, mini-check — but skip sections that would be empty or redundant. Never use a fixed template list. Open with what the learner should grasp first for this topic. Tie every claim to the source. Avoid university metadata, lecturer names, and boilerplate.`;
-  if (profile === 'math_stats') {
-    return `${languageRule} ${mathFormattingRules()} ${adaptiveRules} For math/stats: prefer procedure + interpretation when the topic is computational; prefer definitions + notation when the topic is conceptual; use symbols exactly as the lecture does.`;
+  return buildDeepDivePromptForMode(language, profile, topic, 'explain', '');
+}
+
+function buildDeepDivePromptForMode(language, profile, topic, mode = 'explain', compareContext = '', topicCtx = {}) {
+  const isGerman = language === 'German';
+  const languageRule = `Write in ${language}. Keep headings and explanations in ${language}; keep source terms as labels. ${groundingRules()}`;
+  const parentNote = topicCtx.parent
+    ? (isGerman ? `Unterthema von „${topicCtx.parent}".` : `Subtopic of "${topicCtx.parent}".`)
+    : '';
+  const topicLine = `You teach ONLY the topic "${topic}" using the lecture materials. ${parentNote}`;
+  const modes = {
+    explain: isGerman
+      ? `${topicLine} Goal: VERSTEHEN. Structure with ## headings you choose (4–6). Start with intuition, then definition/notation, then role in THIS lecture, then link to course thread/prerequisites, end with ## Mini-Check (2 short questions). No admin boilerplate.`
+      : `${topicLine} Goal: UNDERSTAND. Use 4–6 ## sections: intuition, definition, role in this lecture, course links, ## Mini-Check (2 questions).`,
+    example: isGerman
+      ? `${topicLine} Goal: EIN BEISPIEL. Exactly ONE worked example from the materials. Use ## Ausgangslage ## Lösungsschritte ## Ergebnis ## Worauf achten. Use lecture notation/numbers/code exactly.`
+      : `${topicLine} Goal: ONE WORKED EXAMPLE. ## Setup ## Steps ## Result ## What to notice.`,
+    trap: isGerman
+      ? `${topicLine} Goal: PRÜFUNGSFALLE. ## Typischer Fehler ## Warum man das verwechselt ## Richtige Argumentation ## Merksatz`
+      : `${topicLine} Goal: EXAM TRAP. ## Typical mistake ## Why students confuse it ## Correct reasoning ## Rule of thumb`,
+    compare: isGerman
+      ? `${topicLine} Goal: KURSVERBINDUNG. Compare this topic to the PRIOR lecture. Use ## Was bleibt gleich ## Was ist neu ## Was man nicht verwechseln darf ## Kurz-Checkliste. Prior lecture materials:\n${compareContext || '(keine vorherige Vorlesung)'}`
+      : `${topicLine} Goal: COURSE LINK. ## What stayed the same ## What is new ## What not to confuse. Prior lecture:\n${compareContext || '(none)'}`
+  };
+  let body = modes[mode] || modes.explain;
+
+  if (profile === 'programming') {
+    const codeRules = isGerman
+      ? `KURSTYP: Programmierung. Pflicht: Mindestens ZWEI fenced Codeblöcke (\`\`\`python oder Sprache der Vorlesung) mit echtem Code aus den Materialien — keine rein textuelle Erklärung ohne Code. Nach jedem Block: Zeile-für-Zeile oder Block-für-Block. Zeige Variablenwerte, Ausgabe, typische Fehler. Modus „Beispiel“: vollständiges lauffähiges Mini-Programm aus der Vorlesung.`
+      : `COURSE TYPE: Programming. REQUIRED: At least TWO fenced code blocks (\`\`\`python or lecture language) with real code from materials — not prose-only. After each block: line-by-line or chunk-by-chunk explanation with variables, output, typical bugs. Mode "example": one complete runnable mini-program from the lecture.`;
+    body = `${languageRule} ${codeRules} ${body}`;
+  } else if (profile === 'math_stats') {
+    body = `${languageRule} ${mathFormattingRules()} ${body}`;
+  } else if (profile === 'psychology') {
+    body = `${languageRule} ${body} ${isGerman ? 'Konstrukt, Operationalisierung, Evidenzgrenzen — keine rein allgemeine Psychologie.' : 'Construct, operationalization, evidence limits — not generic psychology.'}`;
+  } else if (profile === 'applied_methods') {
+    body = `${languageRule} ${body} ${isGerman ? 'Schritte, Entscheidungsregeln, Eingaben/Ausgaben.' : 'Steps, decision rules, inputs/outputs.'}`;
+  } else {
+    body = `${languageRule} ${body}`;
   }
-  if (profile === 'applied_methods') {
-    return `${languageRule} ${adaptiveRules} For applied methods: emphasize decision rules, inputs/outputs, and when the method fails — only where the lecture supports it.`;
-  }
-  return `${languageRule} ${adaptiveRules} For conceptual material: emphasize meaning, distinctions, connections to earlier course threads, and implications.`;
+  return body;
 }
 
 function buildSubtopicPrompt(language, profile, subtopic) {
+  const isGerman = language === 'German';
   const adaptive = `Teach "${subtopic}" as a focused extension of the parent deep dive. Choose 3–5 ## sections that fit this subtopic (do not repeat the parent wholesale). Write in ${language}.`;
+  if (profile === 'programming') {
+    return `${adaptive} ${isGerman ? 'Pflicht: mindestens ein ``` Codeblock mit echtem Code; erkläre Ausführung und eine typische Fehlerquelle.' : 'REQUIRED: at least one ``` code block with real code; explain execution and one typical bug.'}`;
+  }
   if (profile === 'math_stats') {
     return `${adaptive} ${mathFormattingRules()} Prefer steps, traps, and a tiny verification when appropriate.`;
   }
   return `${adaptive} Stay grounded in the parent deep dive only.`;
+}
+
+function normalizeAufgaben(parsed, { language, count = 6 }) {
+  const typeMap = {
+    calculation: language === 'German' ? 'Rechenaufgabe' : 'Calculation',
+    proof: language === 'German' ? 'Beweis' : 'Proof',
+    concept: language === 'German' ? 'Verständnis' : 'Concept',
+    application: language === 'German' ? 'Anwendung' : 'Application'
+  };
+  const exercises = (parsed?.exercises || []).slice(0, count).map((ex, i) => {
+    const rawType = String(ex.type || 'concept').toLowerCase();
+    const typeKey = ['calculation', 'proof', 'concept', 'application'].includes(rawType) ? rawType : 'concept';
+    return {
+      id: String(ex.id || `a${i + 1}`),
+      title: String(ex.title || (language === 'German' ? `Aufgabe ${i + 1}` : `Exercise ${i + 1}`)),
+      topic: String(ex.topic || ''),
+      type: typeKey,
+      typeLabel: typeMap[typeKey],
+      difficulty: ['easy', 'medium', 'hard'].includes(String(ex.difficulty || '').toLowerCase())
+        ? String(ex.difficulty).toLowerCase()
+        : 'medium',
+      prompt: String(ex.prompt || '').trim(),
+      hints: Array.isArray(ex.hints) ? ex.hints.map((h) => String(h).trim()).filter(Boolean).slice(0, 3) : [],
+      solution: String(ex.solution || '').trim(),
+      checkQuestion: String(ex.checkQuestion || '').trim(),
+      sourceNote: String(ex.sourceNote || '').trim()
+    };
+  }).filter((ex) => ex.prompt.length >= 12);
+  return {
+    version: 1,
+    language,
+    generatedAt: new Date().toISOString(),
+    exercises
+  };
+}
+
+function buildAufgabenMarkdown(aufgaben = {}) {
+  const isGerman = aufgaben.language === 'German';
+  const lines = [
+    `# ${isGerman ? 'Aufgaben' : 'Exercises'}`,
+    '',
+    isGerman
+      ? 'Übungsaufgaben aus der Vorlesung — erst selbst lösen, dann Lösung anzeigen.'
+      : 'Practice tasks from the lecture — try yourself first, then reveal the solution.',
+    ''
+  ];
+  for (const ex of aufgaben.exercises || []) {
+    lines.push(`## ${ex.title}`, '');
+    if (ex.topic) lines.push(`*${isGerman ? 'Thema' : 'Topic'}: ${ex.topic} · ${ex.typeLabel} · ${ex.difficulty}*`, '');
+    lines.push(ex.prompt, '');
+    if (ex.hints?.length) {
+      lines.push(`### ${isGerman ? 'Hinweise' : 'Hints'}`);
+      for (const h of ex.hints) lines.push(`- ${h}`);
+      lines.push('');
+    }
+    if (ex.solution) {
+      lines.push(`### ${isGerman ? 'Lösung' : 'Solution'}`);
+      lines.push(ex.solution, '');
+    }
+    if (ex.checkQuestion) {
+      lines.push(`**${isGerman ? 'Selbstcheck' : 'Self-check'}:** ${ex.checkQuestion}`, '');
+    }
+    lines.push('---', '');
+  }
+  return lines.join('\n').trim();
+}
+
+function buildAufgabenPrompt(language, profile, count) {
+  const schema = `Return strict JSON only: {"exercises":[{"id":"1","title":"short title","topic":"linked theme","type":"calculation|proof|concept|application","difficulty":"easy|medium|hard","prompt":"markdown problem","hints":["optional hint"],"solution":"markdown worked solution","checkQuestion":"one sentence self-check","sourceNote":"optional: from slide/exercise sheet or invented practice"}]}`;
+  const languageRule = `Write every field in ${language}, except exact formulas/symbols from the source.`;
+  const base = `${languageRule} ${schema}. Create exactly ${count} exercises grounded ONLY in this lecture.`;
+  if (language === 'German') {
+    const de = `${base} Wenn die PDF echte Übungsaufgaben enthält, extrahiere und formuliere sie nach; ergänze sonst passende Übungsaufgaben zu den Kernthemen. Jede Aufgabe braucht: klare Aufgabenstellung, 0–2 Hinweise, ausführliche Lösung mit Schritten, Selbstcheck. Keine Organisatorik.`;
+    if (profile === 'math_stats') {
+      return `${de} ${mathFormattingRules()} Bevorzuge Rechenaufgaben, Beweise und Konzeptfragen mit echten Zahlen/Notation aus der Vorlesung.`;
+    }
+    return de;
+  }
+  if (profile === 'math_stats') {
+    return `${base} ${mathFormattingRules()} Prefer calculation, proof, and concept checks with notation from the lecture.`;
+  }
+  if (profile === 'programming') {
+    return `${base} Prefer coding tasks: trace output, fix a bug, complete a function, explain a short snippet from the lecture. Solutions must include fenced code blocks.`;
+  }
+  return `${base} If the PDF contains explicit exercises, extract them; otherwise invent appropriate practice for the core themes. Each item needs prompt, hints, worked solution, and self-check.`;
+}
+
+async function generateAufgabenBundle({
+  openai,
+  model,
+  lecturePath,
+  courseName = '',
+  meta = {},
+  overview = '',
+  summary = '',
+  concepts = '',
+  extracted = '',
+  lectureStructure = null
+}) {
+  const structure = lectureStructure || buildLectureStructure({
+    courseName: courseName || meta.course || '',
+    lecturePath,
+    meta,
+    overview,
+    summary,
+    concepts,
+    extracted
+  });
+  const threadContext = buildLectureThreadContextFromMaterials(lecturePath, { overview, summary, concepts, extracted, lectureStructure: structure });
+  const content = [
+    formatLectureStructureForPrompt(structure),
+    threadContext.markdown,
+    overview,
+    summary,
+    concepts,
+    extracted.slice(0, 28000)
+  ].join('\n\n').trim();
+  if (!content) return { success: false, error: 'No lecture content available' };
+  const outputLanguage = meta.outputLanguage || readLectureLanguage(lecturePath, content);
+  const lectureProfile = meta.lectureProfile || readLectureProfile(lecturePath, content);
+  const count = lectureProfile === 'math_stats' ? 6 : 5;
+  const response = await openai.chat.completions.create({
+    model,
+    messages: [
+      { role: 'system', content: buildAufgabenPrompt(outputLanguage, lectureProfile, count) },
+      { role: 'user', content: `Course: ${courseName || meta.course || ''}\nLecture: ${meta.inferredLectureName || ''}\n\nMaterials:\n${content}` }
+    ],
+    temperature: getTemperature(0.35)
+  });
+  const parsed = parseQuizJson(response.choices?.[0]?.message?.content || '');
+  const aufgaben = normalizeAufgaben(parsed, { language: outputLanguage, count });
+  if (!aufgaben.exercises.length) return { success: false, error: 'Model returned no valid exercises' };
+  const markdown = buildAufgabenMarkdown(aufgaben);
+  return {
+    success: true,
+    aufgaben,
+    markdown,
+    tokens: response.usage?.total_tokens || 0
+  };
+}
+
+function writeAufgabenFiles(lecturePath, aufgaben, markdown) {
+  fs.writeFileSync(path.join(lecturePath, 'aufgaben.json'), JSON.stringify(aufgaben, null, 2), 'utf8');
+  fs.writeFileSync(path.join(lecturePath, 'aufgaben.md'), markdown || buildAufgabenMarkdown(aufgaben), 'utf8');
 }
 
 function buildInteractiveQuizPrompt(language, profile, count, difficulty) {

@@ -1,21 +1,30 @@
-import React, { useEffect, useState } from 'react';
+import React, { useState } from 'react';
 
 export default function CourseSelectModal({
   courses,
   files = [],
   fileName,
   suggestion,
+  suggestionLoading = false,
   preferredCourse,
+  confirming = false,
   onConfirm,
   onCancel,
 }) {
-  const [selected, setSelected] = useState(preferredCourse || suggestion?.suggestedCourse || courses[0] || null);
+  const initial =
+    preferredCourse ||
+    suggestion?.suggestedCourse ||
+    courses[0] ||
+    null;
+  const [selected, setSelected] = useState(initial);
+  const [userPicked, setUserPicked] = useState(false);
+
   const isBatch = files.length > 1;
   const displayName = fileName || files[0]?.name;
 
-  useEffect(() => {
-    setSelected(preferredCourse || suggestion?.suggestedCourse || courses[0] || null);
-  }, [suggestion, preferredCourse, courses]);
+  const effectiveSelected = userPicked
+    ? selected
+    : (preferredCourse || (suggestion?.suggestedCourse && !suggestionLoading ? suggestion.suggestedCourse : selected));
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
@@ -26,7 +35,7 @@ export default function CourseSelectModal({
         </h2>
         <p className="text-text-muted text-sm mb-4">
           {isBatch ? (
-            <>All PDFs will be processed one after another into the same course.</>
+            <>All PDFs will be processed one after another into the course you choose below.</>
           ) : (
             <span className="text-text-secondary truncate block">{displayName}</span>
           )}
@@ -35,18 +44,22 @@ export default function CourseSelectModal({
         {isBatch && (
           <ul className="mb-4 max-h-36 overflow-y-auto rounded-lg border border-border-DEFAULT bg-bg-tertiary divide-y divide-border-subtle text-xs">
             {files.map((f) => (
-              <li key={f.path} className="px-3 py-2 text-text-secondary truncate">{f.name}</li>
+              <li key={f.path || f.name} className="px-3 py-2 text-text-secondary truncate">{f.name}</li>
             ))}
           </ul>
         )}
 
-        {suggestion?.suggestedCourse && !isBatch && (
+        {suggestionLoading && (
+          <p className="mb-3 text-xs text-text-muted">Analyzing first PDF for a suggestion… (you can pick a course now)</p>
+        )}
+
+        {suggestion?.suggestedCourse && !isBatch && !userPicked && (
           <div className="mb-4 text-xs rounded-lg border border-accent/30 bg-accent/10 px-3 py-2 text-text-secondary">
-            {preferredCourse ? 'Dropped inside' : 'Smart placement suggests'}{' '}
+            {preferredCourse ? 'Dropped inside' : 'Suggestion'}{' '}
             <span className="text-text-primary font-semibold">
               {suggestion.suggestedCourse.emoji} {suggestion.suggestedCourse.name}
             </span>
-            {typeof suggestion.confidence === 'number' ? ` (${suggestion.confidence})` : ''}.
+            {typeof suggestion.confidence === 'number' && suggestion.confidence > 0 ? ` (${suggestion.confidence})` : ''}.
           </div>
         )}
 
@@ -57,12 +70,16 @@ export default function CourseSelectModal({
         )}
 
         <label className="block text-xs font-semibold text-text-muted uppercase tracking-wide mb-2">
-          Course
+          Course (your selection is used for import)
         </label>
         <select
-          value={selected?.id || ''}
-          onChange={(e) => setSelected(courses.find((c) => c.id === e.target.value))}
-          className="w-full bg-bg-tertiary border border-border-DEFAULT rounded-xl px-4 py-3 text-text-primary text-sm focus:outline-none focus:border-accent mb-6"
+          value={effectiveSelected?.id || ''}
+          onChange={(e) => {
+            setUserPicked(true);
+            setSelected(courses.find((c) => c.id === e.target.value) || null);
+          }}
+          disabled={confirming}
+          className="w-full bg-bg-tertiary border border-border-DEFAULT rounded-xl px-4 py-3 text-text-primary text-sm focus:outline-none focus:border-accent mb-6 disabled:opacity-50"
         >
           {courses.map((c) => (
             <option key={c.id} value={c.id}>{c.emoji} {c.name}</option>
@@ -73,17 +90,22 @@ export default function CourseSelectModal({
           <button
             type="button"
             onClick={onCancel}
-            className="flex-1 py-2.5 rounded-xl border border-border-DEFAULT text-text-secondary hover:bg-bg-hover text-sm"
+            disabled={confirming}
+            className="flex-1 py-2.5 rounded-xl border border-border-DEFAULT text-text-secondary hover:bg-bg-hover text-sm disabled:opacity-40"
           >
             Cancel
           </button>
           <button
             type="button"
-            onClick={() => selected && onConfirm(selected)}
-            disabled={!selected}
+            onClick={() => effectiveSelected && onConfirm(effectiveSelected)}
+            disabled={!effectiveSelected || confirming}
             className="flex-1 py-2.5 rounded-xl bg-accent text-white font-semibold text-sm disabled:opacity-40"
           >
-            {isBatch ? `Process ${files.length} PDFs →` : 'Process →'}
+            {confirming
+              ? 'Starting…'
+              : isBatch
+                ? `Process ${files.length} PDFs →`
+                : 'Process →'}
           </button>
         </div>
       </div>

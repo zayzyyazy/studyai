@@ -9,8 +9,10 @@ Local-first desktop lecture learning system — turns PDFs into structured, teac
 - **My note space + study card** — private notes per lecture; AI builds a personal study card from *your* notes (grounded on the lecture)
 - **Overview** — focus theme, core themes, topic tree, prerequisites, course threads
 - **Summary / Concepts** — distinct roles, language-aware (German lectures stay German)
-- **Deep Dive** — adaptive tutor-style explanations per topic (not fixed worksheets)
+- **Deep Dive** — per-topic modes: Verstehen, Beispiel, Prüfungsfalle, Kursbezug (links to prior lectures)
+- **Study path** — ordered units per lecture (understand → example → practice) with course connections
 - **Interactive Quiz** — in-app MCQ with feedback (lecture-wide + per deep dive)
+- **Aufgaben** — lecture-grounded exercises with hints, worked solutions, and progress tracking
 - **Notes** — auto-saved per lecture
 - **Dashboard & Planner** — what to study today, weekly plan, continue items
 
@@ -55,6 +57,9 @@ Packaged app output:
   concepts.md
   overview.md
   quiz.md
+  aufgaben.json
+  aufgaben.md
+  aufgaben_progress.json
   notes.md
   meta.json
   lecture_structure.json

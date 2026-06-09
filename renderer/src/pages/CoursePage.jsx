@@ -4,18 +4,30 @@ import LectureStructureOverview from '../components/LectureStructureOverview';
 import LectureNotesPanel from '../components/LectureNotesPanel';
 import InteractiveQuizPanel from '../components/InteractiveQuizPanel';
 import DeepDivePanel from '../components/DeepDivePanel';
-import { getDeepDiveTopicSections, getCourseSequence, slugifyTopic } from '../utils/lectureStructure';
+import AufgabenPanel from '../components/AufgabenPanel';
+import CourseStudyHome from '../components/CourseStudyHome';
+import { getDeepDiveTopicSections, getCourseSequence, slugifyTopic, isGermanLecture } from '../utils/lectureStructure';
 
 const TABS = [
   { id: 'overview', label: 'Overview' },
   { id: 'summary', label: 'Summary' },
   { id: 'concepts', label: 'Concepts' },
+  { id: 'aufgaben', label: 'Aufgaben' },
   { id: 'quiz', label: 'Quiz' },
   { id: 'deepDive', label: 'Deep Dive' },
   { id: 'notes', label: 'Notes' },
 ];
 
-export default function CoursePage({ course, processedLecture, onClearProcessed, onDropFiles, state }) {
+export default function CoursePage({
+  course,
+  processedLecture,
+  onClearProcessed,
+  onDropFiles,
+  state,
+  openRequest,
+  onOpenRequestHandled,
+  onBackToDashboard,
+}) {
   const [lectures, setLectures] = useState([]);
   const [selectedLecture, setSelectedLecture] = useState(null);
   const [activeTab, setActiveTab] = useState('overview');
@@ -24,6 +36,7 @@ export default function CoursePage({ course, processedLecture, onClearProcessed,
   const [overviewLoading, setOverviewLoading] = useState(false);
 
   const [deepDiveTopic, setDeepDiveTopic] = useState('');
+  const [deepDiveMode, setDeepDiveMode] = useState('explain');
   const [deepDiveMarkdown, setDeepDiveMarkdown] = useState('');
   const [deepDiveSlug, setDeepDiveSlug] = useState('');
   const [deepDiveLoading, setDeepDiveLoading] = useState(false);
@@ -43,6 +56,24 @@ export default function CoursePage({ course, processedLecture, onClearProcessed,
   const askInputRef = useRef(null);
   const [readingOpen, setReadingOpen] = useState(false);
   const [markingDone, setMarkingDone] = useState(false);
+  const [aufgabenLoading, setAufgabenLoading] = useState(false);
+  const [noteCards, setNoteCards] = useState([]);
+  const [deepStudy, setDeepStudy] = useState(null);
+  const [deepStudyCoverage, setDeepStudyCoverage] = useState(null);
+  const [deepSuggestions, setDeepSuggestions] = useState([]);
+  const [suggestionsLoading, setSuggestionsLoading] = useState(false);
+  const [saveToast, setSaveToast] = useState('');
+
+  const exploredSet = useMemo(() => {
+    const set = new Set();
+    for (const e of deepStudy?.explored || []) {
+      const t = `${String(e.topic || '').toLowerCase().trim()}::${String(e.subtopic || '').toLowerCase().trim()}`;
+      set.add(t);
+    }
+    return set;
+  }, [deepStudy?.explored]);
+
+  const lectureDeepComplete = !!(deepStudy?.complete);
 
   const deepDiveTopicSections = useMemo(
     () => getDeepDiveTopicSections(selectedLecture),
@@ -77,7 +108,10 @@ export default function CoursePage({ course, processedLecture, onClearProcessed,
   const loadLectures = useCallback(async () => {
     setLoading(true);
     try {
-      const result = await window.api.getLectures(course.name);
+      const result = await Promise.race([
+        window.api.getLectures(course.name),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Loading lectures timed out')), 45000)),
+      ]);
       setLectures(Array.isArray(result) ? result : []);
     } catch (err) {
       console.error('getLectures failed:', err);
@@ -94,7 +128,17 @@ export default function CoursePage({ course, processedLecture, onClearProcessed,
       if (!res?.success) return lec;
       const { success, displayName, ...details } = res;
       const name = displayName || details.meta?.inferredLectureName || lec.name;
-      return { ...lec, ...details, name, meta: { ...details.meta, inferredLectureName: name } };
+      return {
+        ...lec,
+        ...details,
+        name,
+        meta: { ...details.meta, inferredLectureName: name },
+        aufgaben: details.aufgaben,
+        aufgabenProgress: details.aufgabenProgress,
+        noteCards: details.noteCards || [],
+        deepStudy: details.deepStudy || null,
+        deepStudyCoverage: details.deepStudyCoverage || null,
+      };
     } catch (err) {
       console.error('getLectureDetails failed:', err);
       return lec;
@@ -119,7 +163,61 @@ export default function CoursePage({ course, processedLecture, onClearProcessed,
     setAskDraft('');
     setAskAnswer('');
     setAskOpen(false);
+    setDeepSuggestions([]);
+    setDeepStudy(null);
+    setDeepStudyCoverage(null);
   }, []);
+
+  const syncDeepStudyState = useCallback((ds, coverage) => {
+    if (ds) setDeepStudy(ds);
+    if (coverage) setDeepStudyCoverage(coverage);
+    else if (ds) {
+      setDeepStudyCoverage({
+        ratio: ds.complete ? 1 : 0,
+        complete: !!ds.complete,
+      });
+    }
+    if (ds?.complete) {
+      setDeepSuggestions([]);
+    } else if (ds?.lastSuggestions?.length) {
+      setDeepSuggestions(ds.lastSuggestions);
+    }
+  }, []);
+
+  const refreshDeepSuggestions = useCallback(async (opts = {}) => {
+    if (!selectedLecture?.path) return;
+    setSuggestionsLoading(true);
+    const res = await window.api.suggestDeepSteps({
+      lecturePath: selectedLecture.path,
+      parentTopic: opts.parentTopic || '',
+      currentTopic: opts.currentTopic || deepDiveTopic || customTopic,
+      currentSubtopic: opts.currentSubtopic || subtopic,
+      deepDiveExcerpt: opts.deepDiveExcerpt ?? deepDiveMarkdown,
+      subtopicExcerpt: opts.subtopicExcerpt ?? subtopicMarkdown,
+    });
+    setSuggestionsLoading(false);
+    if (!res?.success) return;
+    if (res.coverage) setDeepStudyCoverage(res.coverage);
+    if (res.deepStudy) {
+      syncDeepStudyState(res.deepStudy, res.coverage);
+      setSelectedLecture((p) => (p ? { ...p, deepStudy: res.deepStudy, deepStudyCoverage: res.coverage } : p));
+    }
+    else if (res.complete) {
+      setDeepStudy((prev) => ({
+        ...(prev || {}),
+        complete: true,
+        completeReason: res.completeMessage,
+        lastSuggestions: [],
+      }));
+    }
+    setDeepSuggestions(res.complete ? [] : (res.suggestions || []));
+    if (res.complete && res.completeMessage) {
+      setSelectedLecture((p) => (p ? {
+        ...p,
+        deepStudy: { ...(p.deepStudy || {}), complete: true, completeReason: res.completeMessage },
+      } : p));
+    }
+  }, [selectedLecture?.path, deepDiveTopic, customTopic, subtopic, deepDiveMarkdown, subtopicMarkdown, syncDeepStudyState]);
 
   useEffect(() => {
     if (!selectedLecture?.path) return;
@@ -129,6 +227,10 @@ export default function CoursePage({ course, processedLecture, onClearProcessed,
     const first = sections[0];
     const initial = first?.subtopics?.[0]?.label || first?.label || '';
     setDeepDiveTopic(initial);
+    setNoteCards(selectedLecture.noteCards || []);
+    setDeepStudy(selectedLecture.deepStudy || null);
+    setDeepStudyCoverage(selectedLecture.deepStudyCoverage || null);
+    setDeepSuggestions(selectedLecture.deepStudy?.lastSuggestions || []);
   }, [selectedLecture?.id, resetLectureSession]);
 
   useEffect(() => {
@@ -197,10 +299,13 @@ export default function CoursePage({ course, processedLecture, onClearProcessed,
     return () => window.removeEventListener('keydown', onKey);
   }, [readingOpen]);
 
-  const loadCachedDeepDive = async (topic, lecturePath) => {
+  const loadCachedDeepDive = async (topic, lecturePath, mode = 'explain') => {
     const slug = slugifyTopic(topic);
-    const filePath = `${lecturePath}/deep_dives/${slug}.md`;
-    const content = await window.api.readFile(filePath);
+    const modePath = `${lecturePath}/deep_dives/${slug}__${mode}.md`;
+    const legacyPath = `${lecturePath}/deep_dives/${slug}.md`;
+    let content = await window.api.readFile(modePath);
+    if (!content?.trim() && mode !== 'explain') content = await window.api.readFile(legacyPath);
+    if (!content?.trim() && mode === 'explain') content = await window.api.readFile(legacyPath);
     if (content?.trim()) {
       setDeepDiveMarkdown(content);
       setDeepDiveSlug(slug);
@@ -216,8 +321,8 @@ export default function CoursePage({ course, processedLecture, onClearProcessed,
 
   useEffect(() => {
     if (!selectedLecture?.path || !deepDiveTopic || activeTab !== 'deepDive') return;
-    loadCachedDeepDive(deepDiveTopic, selectedLecture.path);
-  }, [deepDiveTopic, selectedLecture?.path, activeTab]);
+    loadCachedDeepDive(deepDiveTopic, selectedLecture.path, deepDiveMode);
+  }, [deepDiveTopic, deepDiveMode, selectedLecture?.path, activeTab]);
 
   const handleLocalDrop = (e) => {
     e.preventDefault();
@@ -229,12 +334,39 @@ export default function CoursePage({ course, processedLecture, onClearProcessed,
     }
   };
 
-  const navigateLecture = async (lec) => {
+  const navigateLecture = useCallback(async (lec, options = {}) => {
     setSelectedLecture({ ...lec, _detailsLoading: true });
-    setActiveTab('overview');
+    setActiveTab(options.tab || 'overview');
     const full = await loadLectureDetails(lec);
     setSelectedLecture(full);
-  };
+    if (options.tab) setActiveTab(options.tab);
+    return full;
+  }, [loadLectureDetails]);
+
+  useEffect(() => {
+    if (!openRequest || openRequest.courseId !== course.id || loading) return;
+
+    const match = lectures.find((l) => {
+      if (openRequest.lecturePath && l.path === openRequest.lecturePath) return true;
+      if (openRequest.lectureId && l.id === openRequest.lectureId) return true;
+      return false;
+    });
+
+    const target = match || (openRequest.lecturePath ? {
+      id: openRequest.lectureId || openRequest.lecturePath.split('/').pop(),
+      path: openRequest.lecturePath,
+      name: openRequest.lectureName || openRequest.lectureId || 'Lecture',
+    } : null);
+
+    if (!target) {
+      onOpenRequestHandled?.();
+      return;
+    }
+
+    navigateLecture(target, { tab: openRequest.tab }).then(() => {
+      onOpenRequestHandled?.();
+    });
+  }, [openRequest?.nonce, loading, lectures, course.id, navigateLecture, onOpenRequestHandled]);
 
   const generateQuickOverview = async () => {
     if (!selectedLecture?.path) return;
@@ -247,24 +379,103 @@ export default function CoursePage({ course, processedLecture, onClearProcessed,
     setOverviewLoading(false);
   };
 
+  const generateAufgaben = async () => {
+    if (!selectedLecture?.path) return;
+    setAufgabenLoading(true);
+    const result = await window.api.generateAufgaben({ lecturePath: selectedLecture.path });
+    if (result.success) {
+      setSelectedLecture((prev) => ({ ...prev, aufgaben: result.aufgaben }));
+    }
+    setAufgabenLoading(false);
+  };
+
+  const headerRegenerate = () => {
+    if (activeTab === 'aufgaben') return generateAufgaben();
+    return generateQuickOverview();
+  };
+
+  const headerRegenerateLabel = () => {
+    if (overviewLoading || aufgabenLoading) return '…';
+    if (activeTab === 'aufgaben') return isGermanLecture(selectedLecture) ? 'Aufgaben neu' : 'Regenerate';
+    return 'Regenerate';
+  };
+
+  const startStudyUnit = async (lec, unit, step) => {
+    const targetTab = step?.tab || 'overview';
+    await navigateLecture(lec, { tab: targetTab });
+    if (step?.tab === 'deepDive' && unit?.label) {
+      setDeepDiveTopic(unit.label);
+      setCustomTopic('');
+      setDeepDiveMode(step.mode || 'explain');
+      setActiveTab('deepDive');
+    } else if (step?.tab) {
+      setActiveTab(step.tab);
+    } else if (unit?.label) {
+      setDeepDiveTopic(unit.label);
+      setActiveTab('overview');
+    } else {
+      setActiveTab('overview');
+    }
+  };
+
+  const handleStudyStep = (unit, step) => {
+    if (!selectedLecture) return;
+    startStudyUnit(selectedLecture, unit, step);
+  };
+
+  const showSaveToast = (msg) => {
+    setSaveToast(msg);
+    setTimeout(() => setSaveToast(''), 2800);
+  };
+
+  const saveToNotes = async ({ markdown, type, title, topic, parentTopic, mode }) => {
+    if (!selectedLecture?.path || !markdown?.trim()) return;
+    const res = await window.api.saveNoteCard({
+      lecturePath: selectedLecture.path,
+      type,
+      title,
+      topic,
+      parentTopic,
+      mode,
+      markdown,
+      bookmarked: true,
+    });
+    if (res?.success) {
+      setNoteCards(res.cards || []);
+      showSaveToast(isGermanLecture(selectedLecture) ? 'In Notes gespeichert' : 'Saved to Notes');
+    }
+  };
+
   const generateTopicDeepDive = async () => {
     const topic = customTopic.trim() || deepDiveTopic;
     if (!selectedLecture?.path || !topic) return;
     setDeepDiveLoading(true);
-    const cached = await loadCachedDeepDive(topic, selectedLecture.path);
+    setDeepSuggestions([]);
+    const cached = await loadCachedDeepDive(topic, selectedLecture.path, deepDiveMode);
     if (!cached) {
-      const result = await window.api.generateDeepDive({ lecturePath: selectedLecture.path, topic });
+      const result = await window.api.generateDeepDive({
+        lecturePath: selectedLecture.path,
+        topic,
+        mode: deepDiveMode,
+      });
       if (result.success) {
         setDeepDiveMarkdown(result.deepDive);
         setDeepDiveSlug(result.slug);
         setTopicQuizData(null);
         setQuizAnswers({});
         setQuizChecked(false);
+        if (result.deepStudy) syncDeepStudyState(result.deepStudy);
       }
     }
     setSubtopic('');
     setSubtopicMarkdown('');
+    const excerpt = cached || deepDiveMarkdown;
     setDeepDiveLoading(false);
+    await refreshDeepSuggestions({
+      currentTopic: topic,
+      deepDiveExcerpt: excerpt,
+      subtopicExcerpt: '',
+    });
   };
 
   const generateSubtopicDeepDive = async () => {
@@ -274,9 +485,31 @@ export default function CoursePage({ course, processedLecture, onClearProcessed,
       lecturePath: selectedLecture.path,
       topicSlug: deepDiveSlug,
       subtopic: subtopic.trim(),
+      parentTopic: deepDiveTopic || customTopic,
     });
-    if (result.success) setSubtopicMarkdown(result.subtopicDive);
+    if (result.success) {
+      setSubtopicMarkdown(result.subtopicDive);
+      if (result.deepStudy) syncDeepStudyState(result.deepStudy);
+    }
     setDeepDiveLoading(false);
+    if (result.success) {
+      await refreshDeepSuggestions({
+        parentTopic: result.parentTopic || deepDiveTopic,
+        currentTopic: deepDiveTopic || customTopic,
+        currentSubtopic: subtopic.trim(),
+        deepDiveExcerpt: deepDiveMarkdown,
+        subtopicExcerpt: result.subtopicDive,
+      });
+    }
+  };
+
+  const handlePickSuggestion = (s) => {
+    if (!s?.label) return;
+    setDeepDiveTopic(s.label);
+    setCustomTopic('');
+    setSubtopic(s.label);
+    setSubtopicMarkdown('');
+    setDeepDiveMarkdown('');
   };
 
   const generateTopicQuiz = async () => {
@@ -330,7 +563,11 @@ export default function CoursePage({ course, processedLecture, onClearProcessed,
       lectureTitle: selectedLecture.name,
     });
     setAskAnswer(result.success ? result.answer : `*${result.error || 'Could not answer'}*`);
+    if (result.deepStudy) syncDeepStudyState(result.deepStudy);
     setAskLoading(false);
+    if (result.success && deepDiveMarkdown) {
+      refreshDeepSuggestions({ currentSubtopic: subtopic });
+    }
   };
 
   const toggleMarkDone = async () => {
@@ -355,6 +592,8 @@ export default function CoursePage({ course, processedLecture, onClearProcessed,
     if (result?.success) {
       setSelectedLecture(null);
       await loadLectures();
+    } else {
+      window.alert(result?.error || 'Could not delete lecture folder from vault.');
     }
   };
 
@@ -369,17 +608,35 @@ export default function CoursePage({ course, processedLecture, onClearProcessed,
     [activeTab, selectedLecture, deepDiveMarkdown, subtopicMarkdown]
   );
 
+  if (!course?.name) {
+    return (
+      <div className="h-full flex items-center justify-center text-sm text-text-muted p-6">
+        Course data is missing — pick another course or restart the app.
+      </div>
+    );
+  }
+
   return (
-    <div className="h-full flex flex-col bg-bg-primary overflow-hidden">
+    <div className="h-full min-h-0 flex flex-col bg-bg-primary overflow-hidden">
       <div className="h-8 drag-region flex-shrink-0" />
       <div className="flex-1 flex overflow-hidden no-drag">
         <aside className="w-52 flex-shrink-0 border-r border-border-subtle flex flex-col overflow-hidden">
-          <div className="px-3 py-2 border-b border-border-subtle">
+          <div className="px-3 py-2 border-b border-border-subtle space-y-2">
+            {onBackToDashboard && (
+              <button
+                type="button"
+                onClick={onBackToDashboard}
+                className="w-full flex items-center gap-1.5 text-[11px] text-text-muted hover:text-accent transition-colors py-1"
+              >
+                <span aria-hidden>←</span>
+                <span>Dashboard</span>
+              </button>
+            )}
             <div className="flex items-center gap-2 min-w-0">
               <span className="text-lg">{course.emoji || '📚'}</span>
               <span className="text-xs font-semibold text-text-primary truncate">{course.name}</span>
             </div>
-            <p className="text-[10px] text-text-muted mt-0.5">{lectures.length} lectures</p>
+            <p className="text-[10px] text-text-muted">{lectures.length} lectures</p>
           </div>
           <div className="flex-1 overflow-y-auto py-1.5">
             {loading ? (
@@ -423,7 +680,23 @@ export default function CoursePage({ course, processedLecture, onClearProcessed,
         </aside>
 
         <div className="flex-1 overflow-hidden flex flex-col">
-          {selectedLecture ? (
+          {!selectedLecture ? (
+            <CourseStudyHome
+              course={course}
+              lectures={lectures}
+              loading={loading}
+              isGerman={isGermanLecture({ meta: { outputLanguage: course.language } })}
+              onSelectLecture={(lec) => navigateLecture(lec)}
+              onStartUnit={startStudyUnit}
+              onOpenCourseLink={(link) => {
+                const target = sequencedLectures.find(
+                  (l) => (link.priorLecturePath && l.path === link.priorLecturePath)
+                    || (link.priorLectureId && l.id === link.priorLectureId)
+                );
+                if (target) navigateLecture(target, { tab: link.tab || 'overview' });
+              }}
+            />
+          ) : (
             <>
               <header className="px-4 pt-3 pb-0 border-b border-border-subtle flex-shrink-0">
                 <div className="flex items-center gap-2 mb-2.5">
@@ -439,8 +712,13 @@ export default function CoursePage({ course, processedLecture, onClearProcessed,
                     <button type="button" onClick={toggleMarkDone} disabled={markingDone} className="text-[10px] px-2 py-1 rounded border border-border-subtle hover:bg-bg-hover">
                       {selectedLecture.meta?.plannerStatus === 'done' ? 'Undo done' : 'Mark done'}
                     </button>
-                    <button type="button" onClick={generateQuickOverview} disabled={overviewLoading} className="text-[10px] px-2 py-1 rounded hover:bg-bg-hover">
-                      {overviewLoading ? '…' : 'Regenerate'}
+                    <button
+                      type="button"
+                      onClick={headerRegenerate}
+                      disabled={overviewLoading || aufgabenLoading}
+                      className="text-[10px] px-2 py-1 rounded hover:bg-bg-hover"
+                    >
+                      {headerRegenerateLabel()}
                     </button>
                     <button type="button" onClick={() => setReadingOpen(true)} className="text-[10px] px-2 py-1 rounded border border-border-subtle">Read</button>
                     <button type="button" onClick={() => window.api.openPath(selectedLecture.path)} className="text-[10px] px-2 py-1 rounded border border-border-subtle">Finder</button>
@@ -468,12 +746,28 @@ export default function CoursePage({ course, processedLecture, onClearProcessed,
                     <p className="text-xs text-text-muted mb-3">Loading lecture content…</p>
                   )}
                   <div className="markdown-body max-w-3xl">
-                    {activeTab === 'overview' && <LectureStructureOverview lecture={selectedLecture} />}
+                    {activeTab === 'overview' && (
+                      <LectureStructureOverview
+                        lecture={selectedLecture}
+                        lectures={sequencedLectures}
+                        onStudyStep={handleStudyStep}
+                        onOpenLecture={(lec, opts) => navigateLecture(lec, opts)}
+                      />
+                    )}
                     {activeTab === 'summary' && (
                       <LectureMarkdown>{selectedLecture.summary || '*No summary.*'}</LectureMarkdown>
                     )}
                     {activeTab === 'concepts' && (
                       <LectureMarkdown>{selectedLecture.concepts || '*No concepts.*'}</LectureMarkdown>
+                    )}
+                    {activeTab === 'aufgaben' && (
+                      <AufgabenPanel
+                        lecturePath={selectedLecture.path}
+                        initialAufgaben={selectedLecture.aufgaben}
+                        initialProgress={selectedLecture.aufgabenProgress}
+                        isGerman={isGermanLecture(selectedLecture)}
+                        onAufgabenUpdated={(aufgaben) => setSelectedLecture((p) => ({ ...p, aufgaben }))}
+                      />
                     )}
                     {activeTab === 'quiz' && (
                       <InteractiveQuizPanel
@@ -486,9 +780,11 @@ export default function CoursePage({ course, processedLecture, onClearProcessed,
                         lecture={selectedLecture}
                         topicSections={deepDiveTopicSections}
                         selectedTopic={deepDiveTopic}
-                        onSelectTopic={setDeepDiveTopic}
+                        onSelectTopic={(t) => { setDeepDiveTopic(t); setDeepDiveMarkdown(''); }}
                         customTopic={customTopic}
                         onCustomTopicChange={setCustomTopic}
+                        deepDiveMode={deepDiveMode}
+                        onDeepDiveModeChange={(m) => { setDeepDiveMode(m); setDeepDiveMarkdown(''); }}
                         deepDiveMarkdown={deepDiveMarkdown}
                         deepDiveSlug={deepDiveSlug}
                         deepDiveLoading={deepDiveLoading}
@@ -506,6 +802,38 @@ export default function CoursePage({ course, processedLecture, onClearProcessed,
                         onGenerateQuiz={generateTopicQuiz}
                         onCheckAll={handleCheckAll}
                         onResetQuiz={() => { setQuizAnswers({}); setQuizChecked(false); }}
+                        onSaveDeepDive={() => saveToNotes({
+                          markdown: deepDiveMarkdown,
+                          type: 'deep_dive',
+                          title: `${deepDiveTopic || customTopic} (${deepDiveMode})`,
+                          topic: customTopic.trim() || deepDiveTopic,
+                          parentTopic: '',
+                          mode: deepDiveMode,
+                        })}
+                        onSaveSubtopic={() => saveToNotes({
+                          markdown: subtopicMarkdown,
+                          type: 'subtopic',
+                          title: subtopic.trim(),
+                          topic: subtopic.trim(),
+                          parentTopic: deepDiveTopic || customTopic,
+                          mode: 'subtopic',
+                        })}
+                        onPickSuggestion={handlePickSuggestion}
+                        deepSuggestions={deepSuggestions}
+                        suggestionsLoading={suggestionsLoading}
+                        lectureComplete={lectureDeepComplete}
+                        completeMessage={deepStudy?.completeReason || ''}
+                        deepStudyCoverage={deepStudyCoverage}
+                        exploredSet={exploredSet}
+                        isGerman={isGermanLecture(selectedLecture)}
+                        lectureProfile={
+                          selectedLecture?.meta?.lectureProfile
+                          || (course?.courseType === 'programming' ? 'programming'
+                            : course?.courseType === 'math' || course?.courseType === 'statistics' ? 'math_stats'
+                              : course?.courseType === 'psychology' ? 'psychology'
+                                : '')
+                          || 'conceptual'
+                        }
                       />
                     )}
                     {activeTab === 'notes' && (
@@ -515,13 +843,23 @@ export default function CoursePage({ course, processedLecture, onClearProcessed,
                         lectureTitle={selectedLecture.name}
                         initialNotes={selectedLecture.notes}
                         initialStudyCard={selectedLecture.studyCard}
+                        initialNoteCards={noteCards}
                         onSaved={(text) => setSelectedLecture((p) => ({ ...p, notes: text }))}
                         onCardGenerated={(card) => setSelectedLecture((p) => ({ ...p, studyCard: card }))}
+                        onCardsChange={(cards) => {
+                          setNoteCards(cards);
+                          setSelectedLecture((p) => (p ? { ...p, noteCards: cards } : p));
+                        }}
                       />
                     )}
                   </div>
                 </div>
 
+                {saveToast && (
+                  <div className="flex-shrink-0 px-4 py-1.5 bg-green-500/15 border-t border-green-500/30 text-center text-xs text-green-400">
+                    {saveToast}
+                  </div>
+                )}
                 <div className="flex-shrink-0 border-t border-border-subtle bg-bg-secondary">
                   {askOpen && askAnswer && (
                     <div className="px-4 pt-3 pb-2 max-h-40 overflow-y-auto border-b border-border-subtle">
@@ -547,8 +885,6 @@ export default function CoursePage({ course, processedLecture, onClearProcessed,
                 </div>
               </div>
             </>
-          ) : (
-            <div className="flex-1 flex items-center justify-center text-text-muted text-sm">Select a lecture</div>
           )}
         </div>
       </div>
@@ -580,6 +916,12 @@ function buildReadingMarkdown(activeTab, lecture, deepDiveMarkdown, subtopicMark
   if (activeTab === 'overview') return lecture.overview || '';
   if (activeTab === 'summary') return lecture.summary || '';
   if (activeTab === 'concepts') return lecture.concepts || '';
+  if (activeTab === 'aufgaben') {
+    const parts = (lecture.aufgaben?.exercises || []).map((ex) => {
+      return [`## ${ex.title}`, '', ex.prompt, '', ex.solution ? `### Solution\n${ex.solution}` : ''].filter(Boolean).join('\n');
+    });
+    return parts.join('\n\n---\n\n') || '';
+  }
   if (activeTab === 'notes') return lecture.notes || '';
   if (activeTab === 'deepDive') {
     return [deepDiveMarkdown, subtopicMarkdown].filter(Boolean).join('\n\n---\n\n');

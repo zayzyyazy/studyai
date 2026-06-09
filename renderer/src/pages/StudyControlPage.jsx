@@ -1,5 +1,9 @@
 import React, { useEffect, useMemo, useState } from 'react';
 
+function isGermanCourse(course) {
+  return /german|deutsch/i.test(course?.language || '');
+}
+
 export default function StudyControlPage({ state, update }) {
   const [overview, setOverview] = useState([]);
 
@@ -62,6 +66,22 @@ export default function StudyControlPage({ state, update }) {
                     Focus now
                   </label>
                 </div>
+                <label className="text-xs text-text-muted block mt-3">
+                  {isGermanCourse(course) ? 'Vorlesungstyp (für KI-Generierung)' : 'Lecture type (for AI generation)'}
+                  <select
+                    value={course.courseType || 'auto'}
+                    onChange={(e) => persistCourse(course.id, { courseType: e.target.value })}
+                    className="w-full mt-1 bg-bg-tertiary border border-border-DEFAULT rounded px-2 py-1.5 text-text-primary text-sm"
+                  >
+                    <option value="auto">Auto detect</option>
+                    <option value="math">Mathematics</option>
+                    <option value="statistics">Statistics</option>
+                    <option value="programming">Programming</option>
+                    <option value="psychology">Psychology</option>
+                    <option value="conceptual">Conceptual</option>
+                    <option value="reading">Reading-heavy</option>
+                  </select>
+                </label>
                 <div className="grid grid-cols-2 gap-3 mt-3">
                   <label className="text-xs text-text-muted">
                     Priority
