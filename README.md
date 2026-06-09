@@ -77,3 +77,7 @@ Merged from:
 - `StudyAI_Freeze_dot_claude` — React UI shell
 
 Unified as **`/Users/zay/Projects/Apps/StudyAI`** — the single canonical app.
+
+## Author
+
+**zayzyyazy** — https://github.com/zayzyyazy
